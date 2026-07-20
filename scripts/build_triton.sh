@@ -116,6 +116,26 @@ if [ "${_MODE}" = "wheel" ]; then
     echo "[build_triton] patched Triton wheel -> ${TRITON_DIST_TRITON_WHEEL_OUT}"
   fi
   ls -l dist/triton-*.whl
+  # `setup.py bdist_wheel` does NOT place libtriton.so inplace, so the source
+  # tree's python/triton/_C/ stays empty. 
+  _tdw_whl="$(ls -t dist/triton-*.whl | head -1)"
+  python3 - "${_tdw_whl}" "${TRITON_DIR}" <<'PY'
+import os, sys, zipfile
+whl, root = sys.argv[1], sys.argv[2]
+src_c = os.path.join(root, "python", "triton", "_C")
+os.makedirs(src_c, exist_ok=True)
+staged = 0
+with zipfile.ZipFile(whl) as z:
+    for n in z.namelist():
+        base = os.path.basename(n)
+        if "_C/" in n and base.startswith("libtriton") and base.endswith(".so"):
+            with open(os.path.join(src_c, base), "wb") as f:
+                f.write(z.read(n))
+            print(f"[build_triton] staged {n} -> {os.path.join(src_c, base)}")
+            staged += 1
+if not staged:
+    sys.stderr.write(f"[build_triton] WARNING: no libtriton*.so found in {whl} to stage\n")
+PY
 else
   # Editable install into the current environment. Any pre-existing Triton must
   # be removed first or it shadows our patched build at import time (import triton
