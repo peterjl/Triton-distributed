@@ -1,4 +1,14 @@
 #!/bin/bash
+# Release / SCM packaging entry point (independently maintained; NOT used for a
+# normal dev install -- that is just `pip install -e python`).
+#
+# Assembles redistributable wheels under output/python so a production env can
+# `PYTHONPATH=output/python` import everything:
+#   1. patched Triton  -> build_triton.sh (wheel mode), unzipped into output/python
+#   2. triton_dist     -> built against that Triton (skip in-setup rebuild), pinned
+#                         to its exact patched version, wheel unzipped into output/python
+#   3. FlashComm       -> wheel unzipped into output/python
+# Toggle parts via BUILD_TRITON_DIST / BUILD_FLASHCOMM (both default on).
 
 # Control which packages to build (both enabled by default)
 # Set BUILD_TRITON_DIST=0 to skip triton_dist, BUILD_FLASHCOMM=0 to skip FlashComm
@@ -69,10 +79,38 @@ mkdir -p output/python
 if [ "$BUILD_TRITON_DIST" -eq 1 ]; then
     echo "========== Building triton_dist =========="
     cd $SCRIPT_DIR
-    pip3 uninstall triton -y
-    export USE_TRITON_DISTRIBUTED_AOT=0
     echo 'numpy<2' > /tmp/pip_install_constraint.txt
+
+    # --- 1) Patched (EXT-enabled) Triton: build its wheel, extract it into
+    # output/python, install it. triton_dist is an out-of-tree plugin that can
+    # ONLY load into this patched Triton (default-visibility + source patches +
+    # libstdc++ version-script); a stock PyPI triton cannot host it. Extracting it
+    # next to triton_dist lets production use both via PYTHONPATH=output/python
+    # (the original triton_dist convention), and pip consumers get bound to the
+    # exact version below.
+    echo "========== Building patched Triton (wheel) =========="
+    pip3 uninstall triton -y || true
+    TRITON_DIST_TRITON_INSTALL_MODE=wheel MAX_JOBS=40 bash scripts/build_triton.sh
+    TRITON_WHL=$(ls -t "$SCRIPT_DIR"/3rdparty/triton/dist/triton-*.whl | head -1)
+    echo "patched Triton wheel: $TRITON_WHL"
+    pip3 install --no-cache-dir "$TRITON_WHL"
+    TRITON_VER=$(python3 -c "import triton; print(triton.__version__)")
+    echo "patched Triton version (triton_dist will pin to this): $TRITON_VER"
+    # Extract into output/python (same convention as triton_dist below) so the
+    # production env can import both via PYTHONPATH=output/python directly.
+    unzip -o "$TRITON_WHL" -d output/python
+
+    # --- 2) triton_dist: compile the plugin against the SAME source tree we just
+    # built the wheel from (the installed wheel ships no C++ headers), skip the
+    # in-setup Triton rebuild, and bind the dependency to the exact patched build.
+    export USE_TRITON_DISTRIBUTED_AOT=0
+    export TRITON_DIST_SKIP_TRITON_BUILD=1
+    export TRITON_SOURCE_DIR="$SCRIPT_DIR/3rdparty/triton"
+    export TRITON_DIST_TRITON_REQUIREMENT="triton==${TRITON_VER}"
     MAX_JOBS=40 pip3 install -c /tmp/pip_install_constraint.txt -e python[build,tests,tutorials] --verbose --no-build-isolation --use-pep517
+    # Release wheels are intentionally JIT-only (no AOT csrc): AOT is optional and
+    # the same kernels JIT-compile on first use. To ship an AOT-enabled release,
+    # uncomment the three lines below (generate kernels, then rebuild with AOT on).
     # bash ./scripts/gen_aot_code.sh
     # export USE_TRITON_DISTRIBUTED_AOT=1
     # MAX_JOBS=40 pip3 install -e python --verbose --no-build-isolation --use-pep517
@@ -80,7 +118,7 @@ if [ "$BUILD_TRITON_DIST" -eq 1 ]; then
     python3 setup.py bdist_wheel
     cd $SCRIPT_DIR
     unzip python/dist/*.whl -d output/python
-    echo "========== triton_dist build done =========="
+    echo "========== triton_dist build done (bound to $TRITON_VER) =========="
 else
     echo "========== Skipping triton_dist (BUILD_TRITON_DIST=0) =========="
 fi

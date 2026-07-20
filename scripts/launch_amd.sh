@@ -20,6 +20,21 @@ case ":${PYTHONPATH}:" in
         ;;
 esac
 
+# Export TRITON_PLUGIN_PATHS before any child imports triton: the out-of-tree
+# distributed dialects/passes/ops live in libtriton_dist.so, which Triton loads
+# exactly once at first `import triton`. Resolving it via triton_dist._plugin
+# does not import triton, so it is safe here. Mirrors the NVIDIA
+# scripts/setenv.sh::set_triton_dist_plugin (sourced by scripts/launch.sh).
+if [ -z "${TRITON_PLUGIN_PATHS}" ]; then
+    _dist_plugin="$(python3 -c 'import triton_dist._plugin as p; print(p.find_plugin() or "")' 2>/dev/null)"
+    if [ -n "${_dist_plugin}" ] && [ -f "${_dist_plugin}" ]; then
+        export TRITON_PLUGIN_PATHS="${_dist_plugin}"
+        echo "TRITON_PLUGIN_PATHS=${TRITON_PLUGIN_PATHS}"
+    else
+        echo "WARNING: libtriton_dist.so not found; build it via 'pip install ./python'"
+    fi
+fi
+
 export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-triton_cache}
 export ROCSHMEM_HOME=${ROCSHMEM_ROOT}
 export ROCSHMEM_BACKEND=${ROCSHMEM_BACKEND:=IPC}

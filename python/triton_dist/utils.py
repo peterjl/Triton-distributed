@@ -873,12 +873,19 @@ def triton_dist_key():
             with open(pyfile, "rb") as f:
                 contents += [hashlib.sha256(f.read()).hexdigest()]
 
-    # backend
+    # backend: hash libtriton plus the out-of-tree distributed plugin .so. The
+    # legacy intrusive build shipped a `libtriton_distributed` inside triton/_C; the
+    # plugin refactor replaces it with `libtriton_dist.so`, located via the plugin
+    # resolver (it may live outside triton/_C, e.g. plugin/build or triton_dist/lib).
     libtriton_hash = hashlib.sha256()
     ext = sysconfig.get_config_var("EXT_SUFFIX").split(".")[-1]
-    libs = ["libtriton", "libtriton_distributed"]
-    for lib in libs:
-        with open(os.path.join(triton.__path__[0], "_C", f"{lib}.{ext}"), "rb") as f:
+    so_paths = [os.path.join(triton.__path__[0], "_C", f"libtriton.{ext}")]
+    from triton_dist._plugin import find_plugin
+    plugin_so = find_plugin()
+    if plugin_so is not None:
+        so_paths.append(plugin_so)
+    for so_path in so_paths:
+        with open(so_path, "rb") as f:
             while True:
                 chunk = f.read(1024**2)
                 if not chunk:

@@ -22,22 +22,9 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-import inspect
 from typing import Dict, Callable, Any
-from functools import wraps
+import inspect
 from triton.language import core
-
-
-def _pointer_type_hash(self):
-    return hash((self.name, self.element_ty, "tt_ptr"))
-
-
-def patch_hash_method_for_pointer_type():
-    # Triton pointer_type defines __eq__ but not __hash__, so dict keys fail.
-    elem_dtype_list = (core.dtype.SINT_TYPES + core.dtype.UINT_TYPES + core.dtype.FP_TYPES + core.dtype.OTHER_TYPES)
-    for elem_dtype in elem_dtype_list:
-        ptr_ty = type(core.pointer_type(core.dtype(elem_dtype)))
-        ptr_ty.__hash__ = _pointer_type_hash
 
 
 class ModuleProxy:
@@ -60,23 +47,29 @@ class ModuleProxy:
         delattr(self._module, name)
 
     def dispatch(self, func: Callable) -> Any:
-        func_signature = inspect.signature(func)
-        parameters = list(func_signature.parameters.values())
-        if "_semantic" not in func_signature.parameters:
-            parameters.append(inspect.Parameter(
-                "_semantic",
-                inspect.Parameter.KEYWORD_ONLY,
-                default=None,
-            ))
+        # Triton's code generator injects `_semantic` / `_generator` into a builtin
+        # only when those names appear in the builtin's *signature* (it reads
+        # `fn.signature`, which `core.builtin` populates from `inspect.signature`).
+        # `functools.wraps(func)` would copy the dispatch stub's signature (no
+        # `_semantic`) onto the wrapper, so the injection would be skipped and the
+        # real backend op (an `@core.extern`) would be called without `_semantic`,
+        # raising "Did you forget to add @triton.jit ?". We therefore expose
+        # `_semantic`/`_generator` explicitly on the wrapper (and avoid `wraps`, which
+        # would re-hide them via `__wrapped__`), then forward each to the resolved
+        # backend method only when it actually accepts it.
+        name = func.__name__
 
         @core.builtin
-        @wraps(func)
-        def wrapper(*args, _semantic=None, **kwargs):
-            method = getattr(self._module, func.__name__)
-            if "_semantic" in inspect.signature(method).parameters:
+        def wrapper(*args, _semantic=None, _generator=None, **kwargs):
+            method = getattr(self._module, name)
+            params = inspect.signature(method).parameters
+            if "_semantic" in params:
                 kwargs["_semantic"] = _semantic
+            if "_generator" in params:
+                kwargs["_generator"] = _generator
             return method(*args, **kwargs)
 
-        wrapper.__signature__ = func_signature.replace(parameters=parameters)
-
+        wrapper.__name__ = name
+        wrapper.__qualname__ = getattr(func, "__qualname__", name)
+        wrapper.__doc__ = func.__doc__
         return wrapper

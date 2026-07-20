@@ -38,7 +38,7 @@ else:
     use_aot = False
 
 if use_aot:
-    from triton._C.libtriton_distributed import distributed
+    from triton_dist._C.libtriton_distributed import distributed
 
 
 class SpGQAFlashDecodeAttention(torch.nn.Module):

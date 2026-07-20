@@ -21,28 +21,29 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+/// Definition of `distributed.extern_call` construction (create-op companion).
+///
+/// Compiled into the companion module libtriton_dist_ext. It includes the
+/// Distributed dialect headers and calls ExternCallOp::create, but those
+/// headers only DECLARE `TypeID<ExternCallOp>`; the single TypeID DEFINE and
+/// the op registration live in the dialect TU compiled into the plugin
+/// (libtriton_dist.so) and resolve at runtime from the RTLD_GLOBAL plugin. So
+/// there is still one TypeID owner -- no cross-library duplication hazard.
+#include "extern_call_builder.h"
+
+#include "python/src/ir.h" // TritonOpBuilder (full definition)
+
 #include "TritonDistributed/Dialect/Distributed/IR/Dialect.h"
-#include "mlir/Pass/PassManager.h"
-#include "passes.h"
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <pybind11/stl_bind.h>
 
-namespace py = pybind11;
+namespace triton::dist {
 
-#ifndef TRITON_USE_ASCEND
-void init_triton_distributed_passes(pybind11::module &&m);
-#else
-void init_triton_distributed_ascend_passes(pybind11::module &&m);
-#endif
-
-void init_triton_distributed_ir(py::module &&m);
-
-void init_triton_distributed(py::module &&m) {
-#ifndef TRITON_USE_ASCEND
-  init_triton_distributed_passes(m.def_submodule("passes"));
-#else
-  init_triton_distributed_ascend_passes(m.def_submodule("ascend_passes"));
-#endif
-  init_triton_distributed_ir(m.def_submodule("ir"));
+mlir::OpState
+createExternCallOp(TritonOpBuilder &self, const std::string &libName,
+                   const std::string &libPath, const std::string &symbol,
+                   std::vector<mlir::Value> &argList,
+                   std::vector<mlir::Type> &retTypes, bool isPure) {
+  return self.create<::mlir::triton::distributed::ExternCallOp>(
+      retTypes, argList, libName, libPath, symbol, isPure);
 }
+
+} // namespace triton::dist

@@ -82,7 +82,7 @@ if command -v nvcc &> /dev/null; then
     fi
 
     echo "Installing CUDA-specific libraries..."
-    
+
     # Check for local flashinfer whl files first
     local_flashinfer_whl=$(find . -name "*flashinfer*.whl" | head -1)
     if [[ -n "$local_flashinfer_whl" ]]; then
@@ -94,14 +94,14 @@ if command -v nvcc &> /dev/null; then
         flashinfer_whl_url="https://flashinfer.ai/whl/${parsed_cuda_slug}/${parsed_pytorch_slug}/"
         pip install flashinfer-python -i "$flashinfer_whl_url"
     fi
-    python3 -c "import flash_attn" >/dev/null 2>&1 || pip3 install flash-attn --no-build-isolation
+    python3 -c "import flash_attn" >/dev/null 2>&1 || pip3 install flash-attn --no-build-isolation --no-deps
     echo "Finished installing CUDA-specific libraries."
 
 # --- AMD ROCm ---
 elif command -v hipcc &> /dev/null; then
     echo "AMD ROCm compiler (hipcc) found. Proceeding with ROCm-specific installations."
     echo "Note: flashinfer does not currently support ROCm and will be skipped."
-    python3 -c "import flash_attn" >/dev/null 2>&1 || pip3 install flash-attn --no-build-isolation
+    python3 -c "import flash_attn" >/dev/null 2>&1 || pip3 install flash-attn --no-build-isolation --no-deps
     echo "Finished installing ROCm-specific libraries."
 else
     echo "NVIDIA CUDA compiler (nvcc) and AMD ROCm compiler (hipcc) not found."
@@ -172,7 +172,24 @@ else
 fi
 
 pip install accelerate
-pip uninstall triton -y
+
+# In the out-of-tree plugin model the patched, plugin-hosting Triton (built by
+# scripts/build_triton.sh and pip-installed as the `triton` dist that
+# libtriton_dist.so binds to) is a HARD dependency of triton_dist -- not a
+# vendored tree on PYTHONPATH. Never `pip uninstall triton` here: that removes the
+# very Triton the plugin loads into, so `import triton` -> `import triton_dist` ->
+# _plugin.find_plugin() all break and plugin discovery returns empty (this is what
+# `pip uninstall triton -y`, inherited from the old monolithic layout, used to do
+# and it silently broke the megakernel/e2e jobs). If an e2e dependency installed
+# above pulled a stock PyPI `triton` wheel that shadowed the patched build,
+# re-assert the patched Triton so it keeps hosting the plugin.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if python3 -c "from triton._C.libtriton import passes; assert hasattr(passes, 'plugin')" 2>/dev/null; then
+    echo "Patched plugin-hosting Triton is intact; leaving it in place."
+else
+    echo "Patched Triton missing or shadowed by a stock wheel; reinstalling the plugin-hosting Triton..."
+    bash "${SCRIPT_DIR}/build_triton.sh"
+fi
 
 # --- Final check ---
 if [[ $? -eq 0 ]]; then
