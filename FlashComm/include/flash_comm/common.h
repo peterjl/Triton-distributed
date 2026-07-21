@@ -170,6 +170,7 @@ private:
   OP(2304, __VA_ARGS__)                                                        \
   OP(2432, __VA_ARGS__)                                                        \
   OP(2816, __VA_ARGS__)                                                        \
+  OP(3072, __VA_ARGS__)                                                        \
   OP(3328, __VA_ARGS__)                                                        \
   OP(3584, __VA_ARGS__)                                                        \
   OP(3840, __VA_ARGS__)                                                        \

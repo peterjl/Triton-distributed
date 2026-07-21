@@ -236,14 +236,15 @@ class EPOverlapKernels:
     def _ensure_dispatch_layout(self, layout_desc: EPCommLayoutDesc, topk_indices: torch.Tensor, *,
                                 comm_num_sm: Optional[int] = None) -> None:
         """Idempotently (re)compute the dispatch layout."""
-        if layout_desc.need_recompute_token_within_expert_offset_and_expert_counts():
+        if layout_desc.need_recompute_token_within_expert_offset_and_expert_counts(topk_indices):
             (layout_desc.token_within_expert_offset,
              layout_desc.expert_counts) = (self.compute_token_within_expert_offset_and_expert_counts(
                  topk_indices,
                  comm_num_sm=comm_num_sm,
              ))
 
-        if not layout_desc.need_recompute_dispatch_layout(self.expert_alignment):
+        num_tokens = int(topk_indices.shape[0])
+        if not layout_desc.need_recompute_dispatch_layout(self.expert_alignment, num_tokens):
             return
 
         if self.expert_alignment > 1:
@@ -278,6 +279,7 @@ class EPOverlapKernels:
             expert_alignment=self.expert_alignment,
         )
         layout_desc.expert_alignment = self.expert_alignment
+        layout_desc.num_tokens = num_tokens
 
     def _select_recv_count(self, layout_desc: EPCommLayoutDesc):
         if layout_desc.expert_alignment > 1:
@@ -400,6 +402,7 @@ class EPOverlapKernels:
                 topk=topk_indices.shape[1],
                 num_experts=cfg.num_experts,
                 world_size=cfg.world_size,
+                local_world_size=cfg.local_world_size,
             )
         self._validate_dispatch_input(input, cfg, op_name="dispatch_cutedsl")
 
@@ -746,6 +749,7 @@ class EPOverlapKernels:
                 topk=topk_indices.shape[1],
                 num_experts=cfg.num_experts,
                 world_size=cfg.world_size,
+                local_world_size=cfg.local_world_size,
             )
         self._validate_dispatch_input(
             input,

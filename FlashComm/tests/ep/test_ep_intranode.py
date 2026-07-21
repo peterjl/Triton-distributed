@@ -515,8 +515,13 @@ def torch_backward_single(input, exp_indices, num_experts, enable_local_combine=
 
 
 def straggler(rank):
-    clock_rate = torch.cuda.clock_rate() * 1e6
-    cycles = random.randint(0, clock_rate * 0.0001) * (rank + 1)
+    try:
+        clock_rate = torch.cuda.clock_rate() * 1e6
+    except ModuleNotFoundError:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        clock_rate_khz = getattr(props, "clock_rate", 0)
+        clock_rate = clock_rate_khz * 1e3 if clock_rate_khz else 2.0e9
+    cycles = random.randint(0, max(0, int(clock_rate * 0.0001))) * (rank + 1)
     torch.cuda._sleep(cycles)
 
 

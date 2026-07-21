@@ -61,6 +61,17 @@ def _normalize_cuda_arch_list(cuda_arch):
     return ';'.join(arch_tokens)
 
 
+def _nccl_pip_dist_names():
+    for major in ("13", "12"):
+        yield f"nvidia-nccl-cu{major}"
+        yield f"nvidia_nccl_cu{major}"
+
+
+def _is_nccl_root(path: Path) -> bool:
+    return ((path / "include" / "nccl.h").is_file() and (path / "include" / "nccl_device.h").is_file()
+            and ((path / "lib" / "libnccl.so").is_file() or (path / "lib" / "libnccl.so.2").is_file()))
+
+
 def get_extension():
     try:
         from torch.utils.cpp_extension import CUDAExtension
@@ -90,14 +101,69 @@ def get_extension():
 
     sources = [
         os.path.join("csrc", "ep", "kernels", "intranode_cuda.cu"),
+        os.path.join("csrc", "ep", "kernels", "internode_cuda.cu"),
         os.path.join("csrc", "ep", "intranode.cpp"),
+        os.path.join("csrc", "ep", "internode.cpp"),
         os.path.join("csrc", "bindings.cpp"),
         os.path.join("csrc", "buffer", "pybind.cpp"),
+        os.path.join("csrc", "buffer", "nccl_gin.cpp"),
         os.path.join("csrc", "buffer", "shareable_block.cpp"),
-        os.path.join("csrc", "buffer", "symmetric_memory.cpp")
+        os.path.join("csrc", "buffer", "symmetric_memory.cpp"),
+        os.path.join("csrc", "buffer", "nccl_symmetric_memory.cpp"),
     ]
     cur_dir = Path(__file__).resolve().parent
     include_dirs = [str(cur_dir / "include")]
+    libraries = []
+
+    def _nccl_pip_root():
+        import site
+        for dist_name in _nccl_pip_dist_names():
+            try:
+                from importlib.metadata import distribution
+                dist = distribution(dist_name)
+            except Exception:
+                continue
+            for entry in dist.files or []:
+                rel = str(entry).replace("\\", "/")
+                if rel.endswith("lib/libnccl.so.2") or rel.endswith("include/nccl_device.h"):
+                    return Path(dist.locate_file(entry)).parent.parent
+        for sp in site.getsitepackages() + [site.getusersitepackages()]:
+            root = Path(sp) / "nvidia" / "nccl"
+            if (root / "lib" / "libnccl.so.2").is_file():
+                return root
+        return None
+
+    custom_nccl_home = os.environ.get("CUSTOM_NCCL_HOME", "")
+    nccl_home = os.environ.get("NCCL_HOME", "")
+    nccl_candidates = []
+    for source, explicit_home in (("CUSTOM_NCCL_HOME", custom_nccl_home), ("NCCL_HOME", nccl_home)):
+        if explicit_home:
+            nccl_candidates.append((source, Path(explicit_home).expanduser()))
+    pip_root = _nccl_pip_root()
+    if pip_root is not None:
+        nccl_candidates.append(("nvidia-nccl", pip_root))
+    nccl_root = None
+    nccl_source = None
+    nccl_link_args = []
+    for source, cand in nccl_candidates:
+        if cand is not None and _is_nccl_root(cand):
+            nccl_root = cand
+            nccl_source = source
+            break
+    if nccl_root is not None:
+        include_dirs.append(str(nccl_root / "include"))
+        library_dirs_extra = [str(nccl_root / "lib")]
+        if (nccl_root / "lib" / "libnccl.so").is_file():
+            libraries.append("nccl")
+        else:
+            nccl_link_args.append("-l:libnccl.so.2")
+        print(f"Using NCCL from {nccl_root} ({nccl_source})")
+    else:
+        library_dirs_extra = []
+        nccl_version = os.environ.get("CUSTOM_NCCL_VERSION", "2.30.4")
+        raise RuntimeError("NCCL with device API (nccl_device.h) not found. "
+                           f"Install nvidia-nccl-cu13=={nccl_version} or nvidia-nccl-cu12=={nccl_version}, "
+                           "or set CUSTOM_NCCL_HOME/NCCL_HOME to headers+lib.")
     # Make `-lcuda` resolvable on both x86_64 and aarch64.
     # On many systems only the CUDA stub has `libcuda.so`, while the driver ships `libcuda.so.1`.
     cuda_home = Path(os.getenv("CUDA_HOME", "/usr/local/cuda"))
@@ -121,13 +187,17 @@ def get_extension():
         Path("/usr/lib/aarch64-linux-gnu"),
         Path("/usr/lib/x86_64-linux-gnu"),
     ]
-    library_dirs = [str(p) for p in candidate_lib_dirs if p and p.exists()]
+    library_dirs = library_dirs_extra + [str(p) for p in candidate_lib_dirs if p and p.exists()]
     extra_compile_args = {}
-    extra_link_args = ['-lcuda', '-lcudart']
+    extra_link_args = nccl_link_args + ['-lcuda', '-lcudart']
+    if nccl_root is not None:
+        extra_compile_args.setdefault("cxx", []).append("-DNCCL_OS_LINUX")
+        extra_compile_args.setdefault("nvcc", []).append("-DNCCL_OS_LINUX")
     smem_define = f"-DFLASH_COMM_MAX_SMEM_BYTES={max_smem_bytes}"
     nvcc_flags = [
         "-std=c++17",
         "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
         "-Xcompiler",
         "-fPIC,-fvisibility=hidden",
         "-O3",
@@ -148,7 +218,8 @@ def get_extension():
     print(f"extra_compile_args={extra_compile_args}")
 
     extension = CUDAExtension(name="flash_comm._C", include_dirs=include_dirs, library_dirs=library_dirs,
-                              sources=sources, extra_compile_args=extra_compile_args, extra_link_args=extra_link_args)
+                              libraries=libraries, sources=sources, extra_compile_args=extra_compile_args,
+                              extra_link_args=extra_link_args)
 
     return extension
 

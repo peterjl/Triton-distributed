@@ -1696,11 +1696,8 @@ void combine_preprocess_inplace_cuda(
     int32_t rank, int32_t num_ranks, int32_t num_sm,
     flash_comm::FlashCommDType dtype, flash_comm::FlashCommDType weight_dtype,
     flash_comm::FlashCommDType offset_dtype, cudaStream_t stream) {
-  constexpr int32_t kNumWarps = 16;
   constexpr int32_t kElemsPerThread = 32;
 
-  constexpr int32_t kNumThreads = kNumWarps * WARP_SIZE;
-  dim3 block_dim(kNumThreads);
   dim3 grid_dim(num_sm);
   size_t smem_size = 0;
   bool has_weight = weight_ptrs != nullptr;
@@ -1713,6 +1710,9 @@ void combine_preprocess_inplace_cuda(
   DISPATCH_TOKEN_DTYPE(dtype, token_t, {
     DISPATCH_OFFSET_TYPE(offset_dtype, offset_t, {
       DISPATCH_HIDDEN_SIZE(hidden_size, kHiddenSize, {
+        constexpr int32_t kNumWarps = kHiddenSize >= 12288 ? 32 : 16;
+        constexpr int32_t kNumThreads = kNumWarps * WARP_SIZE;
+        dim3 block_dim(kNumThreads);
         DISPATCH_WEIGHT_DTYPE(weight_dtype, weight_t, {
           DISPATCH_BOOL(has_weight, kHasWeight, {
             kernels::kernel_combine_preprocess_inplace<

@@ -532,21 +532,18 @@ void combine_preprocess_inplace(
   check_tensor_common(recv_token_count, "recv_token_count", true, torch::kInt32,
                       1);
   check_tensor_shape(recv_token_count, "recv_token_count", {num_ranks});
-  // Must match the launch config of combine_preprocess_inplace_cuda
-  // (kernel_combine_preprocess_inplace) in intranode_cuda.cu.
-  constexpr int32_t kNumWarps = 16;
   constexpr int32_t kElemsPerThread = 32;
   int32_t kVec = 16 / token_size;
   FLASH_CHECK(hidden_size % kVec == 0)
       << "hidden_size must be divisible by kVec, " << hidden_size << " % "
       << kVec << " != 0";
   const int32_t hidden_size_int4 = hidden_size / kVec;
-  FLASH_CHECK(kElemsPerThread / kVec * kNumWarps * WARP_SIZE >=
-              hidden_size_int4)
-      << "kElemsPerThread / kVec * kNumWarps * WARP_SIZE must be less than or "
-         "equal to hidden_size_int4, "
-      << kElemsPerThread / kVec * kNumWarps * WARP_SIZE << " > "
-      << hidden_size_int4;
+  const int32_t preprocess_num_warps = hidden_size >= 12288 ? 32 : 16;
+  const int32_t preprocess_capacity_int4 =
+      kElemsPerThread / kVec * preprocess_num_warps * WARP_SIZE;
+  FLASH_CHECK(preprocess_capacity_int4 >= hidden_size_int4)
+      << "combine_preprocess int4 capacity must cover hidden_size_int4, "
+      << preprocess_capacity_int4 << " < " << hidden_size_int4;
 
   void *weight_ptr = nullptr;
   void *recv_topk_weight_ptr = nullptr;

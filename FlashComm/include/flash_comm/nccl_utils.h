@@ -21,29 +21,18 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <torch/extension.h>
+#pragma once
 
-// Forward declarations
-void bind_intranode_ops(py::module &m);
-void bind_symmetric_memory(py::module &m);
+#include <nccl.h>
+#include <stdexcept>
+#include <string>
 
-namespace flash_comm {
-namespace ep {
-namespace internode {
-void bind_internode_ops(py::module &m);
-} // namespace internode
-} // namespace ep
-} // namespace flash_comm
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  auto ep_intranode =
-      m.def_submodule("ep_intranode", "Expert Parallel intranode operations");
-  bind_intranode_ops(ep_intranode);
-
-  auto ep_internode =
-      m.def_submodule("ep_internode", "Expert Parallel internode (NCCL GIN)");
-  flash_comm::ep::internode::bind_internode_ops(ep_internode);
-
-  auto buffer = m.def_submodule("buffer", "Buffer operations");
-  bind_symmetric_memory(buffer);
-}
+#define NCCL_CHECK(cmd)                                                        \
+  do {                                                                         \
+    ncclResult_t _nccl_res = (cmd);                                            \
+    if (_nccl_res != ncclSuccess) {                                            \
+      throw std::runtime_error(std::string("NCCL Error: ") +                   \
+                               ncclGetErrorString(_nccl_res) + " at " +        \
+                               __FILE__ + ":" + std::to_string(__LINE__));     \
+    }                                                                          \
+  } while (0)
