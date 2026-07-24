@@ -50,7 +50,6 @@ struct DispatchInternodeArgs {
   int32_t max_recv_tokens;
   int32_t num_sm;
   const void *dev_comm_host;
-  uint64_t signal_epoch;
   int32_t num_qps;
   FlashCommDType dtype;
   FlashCommDType weight_dtype;
@@ -80,7 +79,6 @@ struct CombineInternodeArgs {
   int32_t local_world_size;
   int32_t num_sm;
   const void *dev_comm_host;
-  uint64_t signal_epoch;
   int32_t num_qps;
   FlashCommDType dtype;
   FlashCommDType weight_dtype;

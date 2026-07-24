@@ -40,30 +40,43 @@ namespace internode {
 // pybind in csrc/ep/internode.cpp as MAX_*_PIPELINE_CHUNKS /
 // ep_required_gin_signal_count). Do not redefine these values elsewhere.
 //
-// Signal id space (disjoint per protocol):
-//   dispatch: (node * num_qps + qp) * kMaxDispatchPipelineChunks + chunk,
+// Signal id space (disjoint per protocol). GIN signal storage is
+// per-context: every context owns an independent array indexed by the same id
+// numbering, and FlashComm binds one GIN context per QP (context qp carries
+// exactly QP qp's traffic). Signal ids are therefore context-local and do not
+// encode the QP -- the same id on context qp0 and qp1 are distinct physical
+// counters:
+//   dispatch: node * kMaxDispatchPipelineChunks + chunk,
 //             chunk in [0, kMaxDispatchPipelineChunks)
-//   combine : ep_combine_signal_base(nnodes, num_qps) + node * num_qps + qp
+//   combine : ep_combine_signal_base(nnodes) + node
+// The required gin_signals count is independent of the QP count; a call
+// running with num_qps = N only touches contexts qp < N.
+//
+// Signal lifecycle: after each dispatch (resp. combine) a fused
+// reset-signals-then-barrier kernel resets that protocol's signal id range to
+// 0 on every context at a globally quiescent point, and each dispatch/combine
+// call emits exactly one increment per participating (context, signal), so
+// waiters always target the constant value 1. No epoch state is kept
+// anywhere. The reset must precede the barrier arrival: once peers pass the
+// barrier they immediately issue the next step's puts, and a reset racing
+// with an incoming SignalInc would lose the increment and hang the next
+// waiter.
 // ---------------------------------------------------------------------------
 constexpr int32_t kMaxDispatchPipelineChunks = 32;
 constexpr int32_t kMaxCombinePipelineChunks = 32;
 
-constexpr int32_t ep_dispatch_signal_count(int32_t nnodes, int32_t num_qps) {
-  return nnodes * num_qps * kMaxDispatchPipelineChunks;
+constexpr int32_t ep_dispatch_signal_count(int32_t nnodes) {
+  return nnodes * kMaxDispatchPipelineChunks;
 }
 
-constexpr int32_t ep_combine_signal_base(int32_t nnodes, int32_t num_qps) {
-  return ep_dispatch_signal_count(nnodes, num_qps);
+constexpr int32_t ep_combine_signal_base(int32_t nnodes) {
+  return ep_dispatch_signal_count(nnodes);
 }
 
-constexpr int32_t ep_combine_signal_count(int32_t nnodes, int32_t num_qps) {
-  return nnodes * num_qps;
-}
+constexpr int32_t ep_combine_signal_count(int32_t nnodes) { return nnodes; }
 
-constexpr int32_t ep_required_gin_signal_count(int32_t nnodes,
-                                               int32_t num_qps) {
-  return ep_dispatch_signal_count(nnodes, num_qps) +
-         ep_combine_signal_count(nnodes, num_qps);
+constexpr int32_t ep_required_gin_signal_count(int32_t nnodes) {
+  return ep_dispatch_signal_count(nnodes) + ep_combine_signal_count(nnodes);
 }
 
 struct RDMARailSendLayoutDesc {
@@ -138,10 +151,9 @@ void dispatch_internode_cuda(
     int32_t max_slot_num_token, int32_t hidden_size,
     int32_t num_experts_per_rank, int32_t rank, int32_t num_ranks,
     int32_t local_world_size, int32_t max_recv_tokens, int32_t num_sm,
-    const void *dev_comm_host, uint64_t signal_epoch, int32_t num_qps,
-    FlashCommDType dtype, FlashCommDType weight_dtype,
-    FlashCommDType offset_dtype, int32_t topk, int32_t dispatch_pipeline_chunks,
-    cudaStream_t stream);
+    const void *dev_comm_host, int32_t num_qps, FlashCommDType dtype,
+    FlashCommDType weight_dtype, FlashCommDType offset_dtype, int32_t topk,
+    int32_t dispatch_pipeline_chunks, cudaStream_t stream);
 
 void combine_internode_cuda(
     void *combine_x_ptrs, void *combine_weight_ptrs,
@@ -151,13 +163,24 @@ void combine_internode_cuda(
     bool has_weight, int32_t num_token, int32_t max_slot_num_token,
     int32_t hidden_size, int32_t topk, int32_t num_experts_per_rank,
     int32_t rank, int32_t num_ranks, int32_t local_world_size, int32_t num_sm,
-    const void *dev_comm_host, uint64_t signal_epoch, int32_t num_qps,
-    FlashCommDType dtype, FlashCommDType weight_dtype,
-    FlashCommDType offset_dtype, int32_t combine_pipeline_chunks,
-    cudaStream_t stream);
+    const void *dev_comm_host, int32_t num_qps, FlashCommDType dtype,
+    FlashCommDType weight_dtype, FlashCommDType offset_dtype,
+    int32_t combine_pipeline_chunks, cudaStream_t stream);
 
+// Flushes all payload contexts and performs the world barrier. Does not touch
+// any GIN signal.
 void internode_barrier_on_stream_cuda(const void *dev_comm_host,
-                                      int32_t num_qps, cudaStream_t stream);
+                                      int32_t max_qps, cudaStream_t stream);
+
+// Fused variant: resets the context-local EP GIN signals in
+// [signal_begin, signal_end) to 0 on every context in [0, max_qps) and then
+// performs the world barrier. The reset runs before the barrier arrival, when
+// those signals are globally quiescent (see the signal lifecycle note above).
+void internode_reset_signals_barrier_on_stream_cuda(const void *dev_comm_host,
+                                                    int32_t max_qps,
+                                                    int32_t signal_begin,
+                                                    int32_t signal_end,
+                                                    cudaStream_t stream);
 
 void compute_dispatch_layout_cuda(
     int32_t *topk_indices, int32_t *token_within_expert_offset,

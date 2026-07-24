@@ -80,6 +80,14 @@ def parse_args():
         default=0,
         help="GPUs per node. Defaults to EP_LOCAL_WORLD_SIZE/LOCAL_WORLD_SIZE/world_size.",
     )
+    parser.add_argument(
+        "--qp-schedule",
+        type=str,
+        default="",
+        help="Comma-separated per-call QP counts cycled across iterations for internode "
+        "dispatch/combine (e.g. '1,2,4'); each value must be <= FLASH_COMM_EP_NUM_QPS. "
+        "Dispatch and combine cycle with different phases to stress dynamic QP switching.",
+    )
     return parser.parse_args()
 
 
@@ -327,12 +335,29 @@ def main():
         expert_alignment=args.expert_alignment,
     )
 
+    qp_schedule = [int(v) for v in args.qp_schedule.split(",") if v.strip()]
+    if qp_schedule:
+        assert is_internode, "--qp-schedule only applies to internode runs"
+        assert all(v >= 1 for v in qp_schedule), f"invalid --qp-schedule: {qp_schedule}"
+    # Per-protocol call counters; every rank runs the same call sequence, so
+    # the derived per-call QP count stays identical across the EP group.
+    qp_call_idx = {"dispatch": 0, "combine": 0}
+
+    def next_num_qps(kind):
+        if not qp_schedule:
+            return None
+        idx = qp_call_idx[kind]
+        qp_call_idx[kind] = idx + 1
+        # Offset combine by one so dispatch/combine of the same step usually
+        # run with different QP counts.
+        return qp_schedule[(idx + (1 if kind == "combine" else 0)) % len(qp_schedule)]
+
     def run_dispatch(input_tensor, weight, exp_indices, copy_out=False):
         token_offset, expert_counts = ep_kernels.compute_stable_local_token_within_expert_offset_and_expert_counts(
             exp_indices)
         layout_desc = EPCommLayoutDesc(token_within_expert_offset=token_offset, expert_counts=expert_counts)
         dispatch_out, dispatch_weights, layout_desc = ep_kernels.dispatch(input_tensor, exp_indices, weight,
-                                                                          layout_desc)
+                                                                          layout_desc, num_qps=next_num_qps("dispatch"))
         return ep_kernels.dispatch_postprocess(dispatch_out.clone() if copy_out else dispatch_out, dispatch_weights,
                                                layout_desc)
 
@@ -355,7 +380,7 @@ def main():
                 combine_input = prepare_combine_input(combine_input)
             layout_desc.token_topk_send_mask.fill_(1)
             weight = None
-        return ep_kernels.combine(combine_input, layout_desc, weight)
+        return ep_kernels.combine(combine_input, layout_desc, weight, num_qps=next_num_qps("combine"))
 
     def make_combine_input(dispatch_out, dispatch_weight):
         if dispatch_weight is None:

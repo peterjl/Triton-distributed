@@ -102,7 +102,8 @@ void dispatch_internode(
     torch::Tensor node_topk_send_mask,
     torch::Tensor node_token_dst_scatter_indices, int32_t max_slot_num_token,
     int32_t local_num_token, int32_t hidden_size, bool has_weight,
-    int32_t num_experts_per_rank, int32_t num_sm) {
+    int32_t num_experts_per_rank, int32_t num_sm,
+    c10::optional<int64_t> opt_num_qps) {
   if (!buffer::nccl_gin_is_initialized()) {
     throw std::runtime_error(
         "NCCL GIN not initialized; call buffer.nccl_gin_init first");
@@ -111,9 +112,17 @@ void dispatch_internode(
   const int32_t rank = ep_state.rank;
   const int32_t num_ranks = ep_state.nranks;
   const int32_t local_world_size = ep_state.local_world_size;
-  const int32_t num_qps = ep_state.ep_num_qps;
+  const int32_t max_qps = ep_state.ep_num_qps;
+  const int64_t requested_qps = opt_num_qps.value_or(max_qps);
+  FLASH_CHECK(requested_qps >= 1 && requested_qps <= max_qps)
+      << "num_qps must be in [1, " << max_qps
+      << "] (the QP count configured at NCCL GIN init), got " << requested_qps;
+  const int32_t num_qps = static_cast<int32_t>(requested_qps);
   FLASH_CHECK(num_ranks % local_world_size == 0);
-  FLASH_CHECK(num_qps > 0 && num_qps <= ep_state.gin_contexts);
+  FLASH_CHECK(!ep_state.ep_dispatch_needs_barrier)
+      << "internode dispatch requires reset_signals_barrier_all_on_stream "
+         "covering the dispatch signal range after the previous dispatch "
+         "(it resets the GIN signals and protects RDMA slot reuse)";
   const int32_t nnodes = num_ranks / local_world_size;
   FLASH_CHECK(rdma_rail_send_buf.is_cuda() &&
               rdma_rail_send_buf.is_contiguous());
@@ -169,10 +178,6 @@ void dispatch_internode(
       << kMaxDispatchPipelineChunks << "]";
   checked_window_user_ptr(ep_state.comm, rdma_rail_send_win_handle,
                           rdma_rail_send_buf, "rdma_rail_send_buf");
-  // Advance the host epoch only after every check that can throw: a thrown
-  // exception after the epoch bump would leave the host counter permanently
-  // ahead of the device signal counters and deadlock later waits.
-  const uint64_t signal_epoch = buffer::nccl_gin_next_dispatch_signal_epoch();
   dispatch_internode_cuda(
       rdma_rail_send_win_handle, num_tokens_per_rank.data_ptr<int32_t>(),
       node_topk_indices.data_ptr<int32_t>(),
@@ -182,9 +187,9 @@ void dispatch_internode(
       reinterpret_cast<void **>(recv_weights_ptrs.data_ptr()),
       reinterpret_cast<void **>(recv_topk_scatter_indices_ptrs.data_ptr()),
       max_slot_num_token, hidden_size, num_experts_per_rank, rank, num_ranks,
-      local_world_size, max_recv_tokens, num_sm, dev_comm, signal_epoch,
-      num_qps, dtype, weight_dtype, offset_dtype, topk,
-      dispatch_pipeline_chunks, stream);
+      local_world_size, max_recv_tokens, num_sm, dev_comm, num_qps, dtype,
+      weight_dtype, offset_dtype, topk, dispatch_pipeline_chunks, stream);
+  ep_state.ep_dispatch_needs_barrier = true;
 }
 
 void barrier_all_on_stream() {
@@ -198,6 +203,39 @@ void barrier_all_on_stream() {
   internode_barrier_on_stream_cuda(dev_comm, ep_state.ep_num_qps, stream);
 }
 
+// Fused reset-signals-then-barrier over an explicit EP signal id range. Must
+// follow each internode dispatch (with the dispatch signal range) and each
+// combine (with the combine signal range) before the next call of the same
+// protocol; the plain barrier_all_on_stream does not touch signals.
+void reset_signals_barrier_all_on_stream(int64_t signal_begin,
+                                         int64_t signal_end) {
+  if (!buffer::nccl_gin_is_initialized()) {
+    throw std::runtime_error(
+        "NCCL GIN not initialized; call buffer.nccl_gin_init first");
+  }
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto &ep_state = buffer::nccl_gin_require_state();
+  const int32_t max_qps = ep_state.ep_num_qps;
+  const int32_t nnodes = ep_state.nnodes;
+  const int32_t total = ep_required_gin_signal_count(nnodes);
+  FLASH_CHECK(signal_begin >= 0 && signal_begin <= signal_end &&
+              signal_end <= total)
+      << "signal reset range [" << signal_begin << ", " << signal_end
+      << ") must lie within [0, " << total << ")";
+  const void *dev_comm = static_cast<const void *>(&ep_state.dev_comm);
+  internode_reset_signals_barrier_on_stream_cuda(
+      dev_comm, max_qps, static_cast<int32_t>(signal_begin),
+      static_cast<int32_t>(signal_end), stream);
+  // Only a reset covering a protocol's full signal range re-arms that
+  // protocol for its next call.
+  if (signal_begin == 0 && signal_end >= ep_dispatch_signal_count(nnodes)) {
+    ep_state.ep_dispatch_needs_barrier = false;
+  }
+  if (signal_begin <= ep_combine_signal_base(nnodes) && signal_end == total) {
+    ep_state.ep_combine_needs_barrier = false;
+  }
+}
+
 void combine_internode(
     torch::Tensor combine_x_ptrs,
     c10::optional<torch::Tensor> optional_combine_weight_ptrs,
@@ -206,7 +244,8 @@ void combine_internode(
     torch::Tensor local_topk_indices, torch::Tensor local_topk_send_mask,
     torch::Tensor local_token_dst_scatter_indices,
     c10::optional<torch::Tensor> optional_output_weight,
-    int32_t max_slot_num_token, int32_t num_experts_per_rank, int32_t num_sm) {
+    int32_t max_slot_num_token, int32_t num_experts_per_rank, int32_t num_sm,
+    c10::optional<int64_t> opt_num_qps) {
   if (!buffer::nccl_gin_is_initialized()) {
     throw std::runtime_error(
         "NCCL GIN not initialized; call buffer.nccl_gin_init first");
@@ -215,9 +254,17 @@ void combine_internode(
   const int32_t rank = ep_state.rank;
   const int32_t num_ranks = ep_state.nranks;
   const int32_t local_world_size = ep_state.local_world_size;
-  const int32_t num_qps = ep_state.ep_num_qps;
+  const int32_t max_qps = ep_state.ep_num_qps;
+  const int64_t requested_qps = opt_num_qps.value_or(max_qps);
+  FLASH_CHECK(requested_qps >= 1 && requested_qps <= max_qps)
+      << "num_qps must be in [1, " << max_qps
+      << "] (the QP count configured at NCCL GIN init), got " << requested_qps;
+  const int32_t num_qps = static_cast<int32_t>(requested_qps);
   FLASH_CHECK(num_ranks % local_world_size == 0);
-  FLASH_CHECK(num_qps > 0 && num_qps <= ep_state.gin_contexts);
+  FLASH_CHECK(!ep_state.ep_combine_needs_barrier)
+      << "internode combine requires reset_signals_barrier_all_on_stream "
+         "covering the combine signal range after the previous combine "
+         "(it resets the GIN signals and protects RDMA slot reuse)";
   check_ptrs_tensor_i64(combine_x_ptrs, local_world_size, "combine_x_ptrs");
   FLASH_CHECK(rdma_rail_send_buf.is_cuda() &&
               rdma_rail_send_buf.is_contiguous());
@@ -290,9 +337,6 @@ void combine_internode(
       << "]";
   checked_window_user_ptr(ep_state.comm, rdma_rail_send_win_handle,
                           rdma_rail_send_buf, "rdma_rail_send_buf");
-  // Advance the host epoch only after every check that can throw (see
-  // dispatch_internode above).
-  const uint64_t signal_epoch = buffer::nccl_gin_next_combine_signal_epoch();
   combine_internode_cuda(
       combine_x_ptrs.data_ptr(), combine_weight_ptrs, rdma_rail_send_win_handle,
       output.data_ptr(), output_weight, local_topk_indices.data_ptr<int32_t>(),
@@ -300,8 +344,9 @@ void combine_internode(
       local_token_dst_scatter_indices.data_ptr<int32_t>(),
       num_tokens_per_rank.data_ptr<int32_t>(), has_weight, num_token,
       max_slot_num_token, hidden_size, topk, num_experts_per_rank, rank,
-      num_ranks, local_world_size, num_sm, dev_comm, signal_epoch, num_qps,
-      dtype, weight_dtype, offset_dtype, combine_pipeline_chunks, stream);
+      num_ranks, local_world_size, num_sm, dev_comm, num_qps, dtype,
+      weight_dtype, offset_dtype, combine_pipeline_chunks, stream);
+  ep_state.ep_combine_needs_barrier = true;
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -437,14 +482,28 @@ void bind_internode_ops(py::module &m) {
   m.attr("MAX_COMBINE_PIPELINE_CHUNKS") = py::int_(kMaxCombinePipelineChunks);
   m.def(
       "ep_required_gin_signal_count",
-      [](int nnodes, int ep_num_qps) {
-        return ep_required_gin_signal_count(nnodes, ep_num_qps);
-      },
-      py::arg("nnodes"), py::arg("ep_num_qps"),
-      "Minimum gin_signals needed for per-chunk dispatch and per-QP combine "
-      "signals.");
+      [](int nnodes) { return ep_required_gin_signal_count(nnodes); },
+      py::arg("nnodes"),
+      "Minimum gin_signals needed for the context-local per-chunk dispatch "
+      "and combine signals (independent of the QP count).");
+  m.def(
+      "ep_dispatch_signal_count",
+      [](int nnodes) { return ep_dispatch_signal_count(nnodes); },
+      py::arg("nnodes"), "Size of the dispatch signal id range [0, count).");
+  m.def(
+      "ep_combine_signal_base",
+      [](int nnodes) { return ep_combine_signal_base(nnodes); },
+      py::arg("nnodes"),
+      "First combine signal id; the combine range is [base, "
+      "ep_required_gin_signal_count).");
 
   m.def("barrier_all_on_stream", &barrier_all_on_stream);
+  m.def("reset_signals_barrier_all_on_stream",
+        &reset_signals_barrier_all_on_stream, py::arg("signal_begin"),
+        py::arg("signal_end"),
+        "Reset EP GIN signals in [signal_begin, signal_end) at the quiescent "
+        "point, then world barrier. Required after each internode "
+        "dispatch/combine with that protocol's signal range.");
 
   m.def("compute_dispatch_layout", &compute_dispatch_layout,
         py::arg("topk_indices"), py::arg("token_within_expert_offset"),
@@ -506,7 +565,8 @@ void bind_internode_ops(py::module &m) {
         py::arg("node_token_dst_scatter_indices"),
         py::arg("max_slot_num_token"), py::arg("local_num_token"),
         py::arg("hidden_size"), py::arg("has_weight"),
-        py::arg("num_experts_per_rank"), py::arg("num_sm"));
+        py::arg("num_experts_per_rank"), py::arg("num_sm"),
+        py::arg("num_qps") = c10::nullopt);
 
   m.def("combine_internode", &combine_internode, py::arg("combine_x_ptrs"),
         py::arg("combine_weight_ptrs"), py::arg("rdma_rail_send_buf"),
@@ -515,7 +575,7 @@ void bind_internode_ops(py::module &m) {
         py::arg("local_topk_send_mask"),
         py::arg("local_token_dst_scatter_indices"), py::arg("output_weight"),
         py::arg("max_slot_num_token"), py::arg("num_experts_per_rank"),
-        py::arg("num_sm"));
+        py::arg("num_sm"), py::arg("num_qps") = c10::nullopt);
 }
 
 } // namespace internode

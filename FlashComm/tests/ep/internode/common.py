@@ -56,7 +56,7 @@ def init_ep_nccl(ep_group: dist.ProcessGroup, local_world_size: int) -> None:
     gin_contexts = ep_num_qps
     gin_signals = max(
         16,
-        _round_up(int(_ep_inter.ep_required_gin_signal_count(nnodes, ep_num_qps)), 16),
+        _round_up(int(_ep_inter.ep_required_gin_signal_count(nnodes)), 16),
     )
     gin_rail_barriers = 16
     gin_queue_depth = 4096

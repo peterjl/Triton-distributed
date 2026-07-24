@@ -40,15 +40,19 @@ struct NcclGinState {
   int lsa_rank = 0;
   int lsa_size = 0;
   int nnodes = 0;
-  int node_id = 0;
   ncclComm_t comm = nullptr;
   ncclDevComm dev_comm{};
   int gin_type = 0;
   int gin_contexts = 0;
-  int gin_signals = 0;
+  // Maximum QP count fixed at init time. It defines the (stable) GIN signal-id
+  // layout; each dispatch/combine call may use any runtime num_qps in
+  // [1, ep_num_qps].
   int ep_num_qps = 1;
-  uint64_t dispatch_signal_epoch = 0;
-  uint64_t combine_signal_epoch = 0;
+  // Enqueue-order guards: each internode dispatch (resp. combine) must be
+  // separated from the previous one by an internode barrier, which resets the
+  // GIN signals and protects RDMA slot reuse.
+  bool ep_dispatch_needs_barrier = false;
+  bool ep_combine_needs_barrier = false;
   bool initialized = false;
 };
 
@@ -68,8 +72,6 @@ ncclComm_t nccl_gin_comm();
 const ncclDevComm *nccl_gin_dev_comm();
 int nccl_gin_lsa_rank();
 int nccl_gin_lsa_size();
-uint64_t nccl_gin_next_dispatch_signal_epoch(uint64_t signal_increments = 1);
-uint64_t nccl_gin_next_combine_signal_epoch(uint64_t signal_increments = 1);
 
 } // namespace buffer
 } // namespace flash_comm

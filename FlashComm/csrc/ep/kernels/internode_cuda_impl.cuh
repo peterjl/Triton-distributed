@@ -47,23 +47,29 @@ constexpr int kGinDispatchPutCtx = 0;
 constexpr int kGinCombinePutCtx = 0;
 constexpr int kGinBarrierCtx = 0;
 
-// GIN signal ids are partitioned by protocol, node, QP and dispatch chunk
+// GIN signal ids are partitioned by protocol, node and dispatch chunk
 // (kMaxDispatchPipelineChunks and the id-space layout live in
-// flash_comm/ep/internode.h). Per-chunk dispatch signals avoid relying on
-// completion ordering across independently pipelined RDMA puts.
+// flash_comm/ep/internode.h). Ids are context-local: signal storage is
+// per-context and one context carries exactly one QP's traffic, so the QP is
+// selected by the ncclGin context index, never encoded in the id. Per-chunk
+// dispatch signals avoid relying on completion ordering across independently
+// pipelined RDMA puts.
 __device__ __forceinline__ ncclGinSignal_t dispatch_node_signal(int32_t node,
-                                                                int32_t qp,
-                                                                int32_t num_qps,
                                                                 int32_t chunk) {
-  return static_cast<ncclGinSignal_t>(
-      (node * num_qps + qp) * kMaxDispatchPipelineChunks + chunk);
+  return static_cast<ncclGinSignal_t>(node * kMaxDispatchPipelineChunks +
+                                      chunk);
 }
 
-__device__ __forceinline__ ncclGinSignal_t
-combine_node_signal(int32_t nnodes, int32_t node, int32_t qp, int32_t num_qps) {
-  return static_cast<ncclGinSignal_t>(ep_combine_signal_base(nnodes, num_qps) +
-                                      node * num_qps + qp);
+__device__ __forceinline__ ncclGinSignal_t combine_node_signal(int32_t nnodes,
+                                                               int32_t node) {
+  return static_cast<ncclGinSignal_t>(ep_combine_signal_base(nnodes) + node);
 }
+
+// No epoch state anywhere: the internode barrier kernel resets every EP
+// signal to 0 at a globally quiescent point (see kernel_internode_gin_barrier)
+// and each dispatch/combine emits exactly one increment per participating
+// signal, so every wait targets the constant value below.
+constexpr uint64_t kGinSignalStepTarget = 1;
 
 __device__ __forceinline__ void split_qp_range(size_t bytes, int32_t num_qps,
                                                int32_t qp, size_t &off,
@@ -416,7 +422,7 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
 }
 
 void __global__ __launch_bounds__(512, 1)
-    kernel_internode_gin_barrier(ncclDevComm dev_comm, int32_t num_qps) {
+    kernel_internode_gin_barrier(ncclDevComm dev_comm, int32_t max_qps) {
   // The barrier is also used after stream-ordered D2D copies populate the
   // registered RDMA window. Publish those writes at system scope before peers
   // can issue GIN puts that read the window in the next kernel.
@@ -424,22 +430,81 @@ void __global__ __launch_bounds__(512, 1)
     __threadfence_system();
   }
   __syncthreads();
-  gin_world_barrier_release(dev_comm, num_qps);
+  gin_world_barrier_release(dev_comm, max_qps);
+}
+
+// Fused reset-signals-then-barrier. Signal ids are context-local, so the
+// range [signal_begin, signal_end) is reset on every context in [0, max_qps).
+// The order is load-bearing: the reset must complete before this rank arrives
+// at the barrier. Pre-arrival those signals are quiescent, which resetSignal
+// requires: all increments expected by the preceding dispatch/combine were
+// both emitted and drained (their kernels wait for every emitted signal
+// before completing, and this kernel is stream-ordered after them), while
+// peers cannot issue the next step's puts until this rank arrives. Resetting
+// after the barrier would instead race with the next step's incoming
+// SignalInc and could lose an increment (hanging the next waiter). Subsequent
+// dispatch/combine kernels wait for the constant kGinSignalStepTarget.
+void __global__ __launch_bounds__(512, 1)
+    kernel_internode_gin_reset_signals_barrier(ncclDevComm dev_comm,
+                                               int32_t max_qps,
+                                               int32_t signal_begin,
+                                               int32_t signal_end) {
+  const int32_t range = signal_end - signal_begin;
+  const int32_t total = range * max_qps;
+  for (int32_t i = static_cast<int32_t>(threadIdx.x); i < total;
+       i += static_cast<int32_t>(blockDim.x)) {
+    // kGinDispatchPutCtx == kGinCombinePutCtx == 0: contexts [0, max_qps)
+    // cover both protocols' payload contexts.
+    const int32_t ctx = i / range;
+    const ncclGinSignal_t sig =
+        static_cast<ncclGinSignal_t>(signal_begin + i % range);
+    ncclGin sig_gin{dev_comm, ctx};
+    sig_gin.resetSignal(sig);
+  }
+  // Publish every thread's resets (and any stream-ordered D2D writes into the
+  // RDMA window) at system scope before arriving at the barrier: sync first so
+  // thread 0's fence covers all reset stores.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence_system();
+  }
+  __syncthreads();
+  gin_world_barrier_release(dev_comm, max_qps);
 }
 
 } // namespace kernels
 
 void internode_barrier_on_stream_cuda(const void *dev_comm_host,
-                                      int32_t num_qps, cudaStream_t stream) {
-  FLASH_CHECK(num_qps > 0);
+                                      int32_t max_qps, cudaStream_t stream) {
+  FLASH_CHECK(max_qps > 0);
   ncclDevComm dev_comm = *static_cast<const ncclDevComm *>(dev_comm_host);
   dim3 block_dim(512);
   dim3 grid_dim(1);
-  void *kernel_args[] = {&dev_comm, &num_qps};
+  void *kernel_args[] = {&dev_comm, &max_qps};
   flash_comm::launch_kernel_ex((void *)kernels::kernel_internode_gin_barrier,
                                grid_dim, block_dim, kernel_args, 0, stream,
                                flash_comm::internal::get_cga_cluster_size(),
                                false);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void internode_reset_signals_barrier_on_stream_cuda(const void *dev_comm_host,
+                                                    int32_t max_qps,
+                                                    int32_t signal_begin,
+                                                    int32_t signal_end,
+                                                    cudaStream_t stream) {
+  FLASH_CHECK(max_qps > 0);
+  FLASH_CHECK(signal_begin >= 0 && signal_begin <= signal_end)
+      << "invalid EP signal reset range [" << signal_begin << ", " << signal_end
+      << ")";
+  ncclDevComm dev_comm = *static_cast<const ncclDevComm *>(dev_comm_host);
+  dim3 block_dim(512);
+  dim3 grid_dim(1);
+  void *kernel_args[] = {&dev_comm, &max_qps, &signal_begin, &signal_end};
+  flash_comm::launch_kernel_ex(
+      (void *)kernels::kernel_internode_gin_reset_signals_barrier, grid_dim,
+      block_dim, kernel_args, 0, stream,
+      flash_comm::internal::get_cga_cluster_size(), false);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -516,10 +581,9 @@ void dispatch_internode_cuda(
     int32_t max_slot_num_token, int32_t hidden_size,
     int32_t num_experts_per_rank, int32_t rank, int32_t num_ranks,
     int32_t local_world_size, int32_t max_recv_tokens, int32_t num_sm,
-    const void *dev_comm_host, uint64_t signal_epoch, int32_t num_qps,
-    FlashCommDType dtype, FlashCommDType weight_dtype,
-    FlashCommDType offset_dtype, int32_t topk, int32_t dispatch_pipeline_chunks,
-    cudaStream_t stream) {
+    const void *dev_comm_host, int32_t num_qps, FlashCommDType dtype,
+    FlashCommDType weight_dtype, FlashCommDType offset_dtype, int32_t topk,
+    int32_t dispatch_pipeline_chunks, cudaStream_t stream) {
   FLASH_CHECK(num_ranks % local_world_size == 0);
   FLASH_CHECK(num_qps > 0);
   FLASH_CHECK(num_sm > 0);
@@ -545,7 +609,6 @@ void dispatch_internode_cuda(
                                            max_recv_tokens,
                                            num_sm,
                                            dev_comm_host,
-                                           signal_epoch,
                                            num_qps,
                                            dtype,
                                            weight_dtype,
@@ -569,10 +632,9 @@ void combine_internode_cuda(
     bool has_weight, int32_t num_token, int32_t max_slot_num_token,
     int32_t hidden_size, int32_t topk, int32_t num_experts_per_rank,
     int32_t rank, int32_t num_ranks, int32_t local_world_size, int32_t num_sm,
-    const void *dev_comm_host, uint64_t signal_epoch, int32_t num_qps,
-    FlashCommDType dtype, FlashCommDType weight_dtype,
-    FlashCommDType offset_dtype, int32_t combine_pipeline_chunks,
-    cudaStream_t stream) {
+    const void *dev_comm_host, int32_t num_qps, FlashCommDType dtype,
+    FlashCommDType weight_dtype, FlashCommDType offset_dtype,
+    int32_t combine_pipeline_chunks, cudaStream_t stream) {
   FLASH_CHECK(num_ranks % local_world_size == 0);
   FLASH_CHECK(num_qps > 0);
   FLASH_CHECK(num_sm > 0);
@@ -600,7 +662,6 @@ void combine_internode_cuda(
                                           local_world_size,
                                           num_sm,
                                           dev_comm_host,
-                                          signal_epoch,
                                           num_qps,
                                           dtype,
                                           weight_dtype,
@@ -779,15 +840,15 @@ __device__ __forceinline__ void rdma_dispatch_source_slot_ptrs(
 // source node that this rank is currently consuming in the ring.
 //
 // Exactly one dispatch signal per (dst_node, qp, chunk) is emitted per call
-// (bare signal when the payload slice is empty), so the host-side epoch and
-// the device signal counters stay in lockstep for any num_qps / chunk config.
+// (bare signal when the payload slice is empty), so waiters can target
+// snapshot + 1 for any num_qps / chunk config.
 template <typename token_t, typename weight_t, int32_t kHiddenSize,
           int32_t kTopk, bool kHasWeight, typename Coop>
 __device__ __forceinline__ void internode_producer_ring_put(
     ncclDevComm dev_comm, const RDMARailWindowDesc &desc, int32_t rank,
     int32_t local_world_size, int32_t dst_node, int32_t local_num_tokens,
-    int32_t num_qps, int32_t qp_to_send, ncclGinSignal_t completion_signal,
-    Coop coop, int32_t dispatch_pipeline_chunks) {
+    int32_t num_qps, int32_t qp_to_send, Coop coop,
+    int32_t dispatch_pipeline_chunks) {
   const int32_t local_rank = rank % local_world_size;
   const int32_t my_node = rank / local_world_size;
   if (dst_node == my_node) {
@@ -797,6 +858,7 @@ __device__ __forceinline__ void internode_producer_ring_put(
     return;
   }
   const int32_t qp = qp_to_send;
+  const ncclGinSignal_t completion_signal = dispatch_node_signal(my_node, 0);
   ncclGin qp_gin{dev_comm, kGinDispatchPutCtx + qp};
   const size_t src_off =
       static_cast<size_t>(desc.source_slot(my_node)) * desc.slot_stride_bytes;
@@ -854,7 +916,7 @@ __device__ __forceinline__ void internode_producer_ring_put(
               : 0;
 
       const ncclGinSignal_t chunk_completion_signal =
-          dispatch_node_signal(my_node, qp, num_qps, chunk);
+          dispatch_node_signal(my_node, chunk);
       int32_t remaining_regions = (token_slice_bytes > 0 ? 1 : 0) +
                                   (meta_slice_bytes > 0 ? 3 : 0) +
                                   (weight_slice_bytes > 0 ? 1 : 0);
@@ -1016,9 +1078,9 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
         int32_t *num_tokens_per_rank, offset_t *node_topk_indices,
         int32_t *node_topk_send_mask, offset_t *node_token_dst_scatter_indices,
         int32_t num_experts_per_rank, int32_t rank, int32_t num_ranks,
-        int32_t local_world_size, int32_t max_recv_tokens,
-        uint64_t signal_epoch, int32_t num_qps, void *recv_x_ptrs,
-        void **recv_weights_ptrs, offset_t **recv_topk_scatter_indices_ptrs,
+        int32_t local_world_size, int32_t max_recv_tokens, int32_t num_qps,
+        void *recv_x_ptrs, void **recv_weights_ptrs,
+        offset_t **recv_topk_scatter_indices_ptrs,
         int32_t dispatch_pipeline_chunks) {
   extern __shared__ __align__(1024) uint8_t smem_buffer[];
   using smem_t = smem::DispatchIntraNodeSmem<token_t, weight_t, offset_t,
@@ -1081,11 +1143,10 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
     if (src_node == my_node) {
       return;
     }
+    const ncclGinSignal_t wait_sig = dispatch_node_signal(src_node, 0);
     for (int32_t qp = 0; qp < num_qps; ++qp) {
-      const ncclGinSignal_t wait_sig =
-          dispatch_node_signal(src_node, qp, num_qps, 0);
       ncclGin wait_gin{dev_comm, kGinDispatchPutCtx + qp};
-      wait_gin.waitSignal(gin_warp, wait_sig, signal_epoch);
+      wait_gin.waitSignal(gin_warp, wait_sig, kGinSignalStepTarget);
     }
     __threadfence_system();
     __syncwarp();
@@ -1098,11 +1159,10 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
     chunk = chunk < 0
                 ? 0
                 : (chunk >= dispatch_chunks ? dispatch_chunks - 1 : chunk);
+    const ncclGinSignal_t wait_sig = dispatch_node_signal(src_node, chunk);
     for (int32_t qp = 0; qp < num_qps; ++qp) {
-      const ncclGinSignal_t wait_sig =
-          dispatch_node_signal(src_node, qp, num_qps, chunk);
       ncclGin wait_gin{dev_comm, kGinDispatchPutCtx + qp};
-      wait_gin.waitSignal(gin_warp, wait_sig, signal_epoch);
+      wait_gin.waitSignal(gin_warp, wait_sig, kGinSignalStepTarget);
     }
     __threadfence_system();
     __syncwarp();
@@ -1119,13 +1179,10 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
           (my_node + nnodes - ((node_offset + 1) % nnodes)) % nnodes;
 
       for (int32_t qp = block_id; qp < num_qps; qp += num_block) {
-        const ncclGinSignal_t completion_signal =
-            dispatch_node_signal(my_node, qp, num_qps, 0);
         internode_producer_ring_put<token_t, weight_t, kHiddenSize, kTopk,
                                     kHasWeight>(
             dev_comm, rdma_desc, rank, local_world_size, prefetch_dst_node,
-            local_num_token, num_qps, qp, completion_signal, gin_warp,
-            dispatch_chunks);
+            local_num_token, num_qps, qp, gin_warp, dispatch_chunks);
       }
       if (dispatch_chunks == 1) {
         wait_remote_source_node(gin_warp, src_node);
@@ -1172,6 +1229,28 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
         }
         __syncwarp();
         ++producer_pipe_state;
+      }
+    }
+
+    // Chunked waits above only cover chunks whose tokens this CTA consumed,
+    // so some of this step's signal increments may still be in flight when
+    // the CTAs exit. Block 0 drains every (node, qp, chunk) signal emitted
+    // this step so the counters are settled before the stream-ordered barrier
+    // kernel resets them. (With dispatch_chunks == 1 the per-node waits above
+    // already cover every emitted signal.)
+    if (dispatch_chunks > 1 && block_id == 0) {
+      for (int32_t src_node = 0; src_node < nnodes; ++src_node) {
+        if (src_node == my_node) {
+          continue;
+        }
+        for (int32_t qp = 0; qp < num_qps; ++qp) {
+          ncclGin wait_gin{dev_comm, kGinDispatchPutCtx + qp};
+          for (int32_t chunk = 0; chunk < dispatch_chunks; ++chunk) {
+            const ncclGinSignal_t wait_sig =
+                dispatch_node_signal(src_node, chunk);
+            wait_gin.waitSignal(gin_warp, wait_sig, kGinSignalStepTarget);
+          }
+        }
       }
     }
   } else if (is_consumer_warp) {
@@ -1350,7 +1429,6 @@ void detail::dispatch_internode_cuda_hidden(
   auto max_recv_tokens = args.max_recv_tokens;
   auto num_sm = args.num_sm;
   auto dev_comm_host = args.dev_comm_host;
-  auto signal_epoch = args.signal_epoch;
   auto num_qps = args.num_qps;
   auto dtype = args.dtype;
   auto weight_dtype = args.weight_dtype;
@@ -1432,7 +1510,6 @@ void detail::dispatch_internode_cuda_hidden(
                                    &num_ranks_arg,
                                    &local_world_size_arg,
                                    &max_recv_tokens_arg,
-                                   &signal_epoch,
                                    &num_qps_arg,
                                    &recv_x_ptrs,
                                    &recv_weights_ptrs,
@@ -1465,8 +1542,7 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
                              void *combine_weight_ptrs, int32_t num_token,
                              int32_t num_experts_per_rank, int32_t rank,
                              int32_t num_ranks, int32_t local_world_size,
-                             uint64_t signal_epoch, int32_t num_qps,
-                             int32_t combine_pipeline_chunks) {
+                             int32_t num_qps, int32_t combine_pipeline_chunks) {
   static_assert(kWarpsPerWG > 1, "kWarpsPerWG must be greater than 1");
   extern __shared__ __align__(1024) uint8_t smem_buffer[];
   using smem_t =
@@ -1572,7 +1648,7 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
     for (int32_t rdma_qp = rdma_warp_id; rdma_qp < num_qps;
          rdma_qp += num_rdma_warps) {
       const ncclGinSignal_t completion_signal =
-          combine_node_signal(nnodes, my_node, rdma_qp, num_qps);
+          combine_node_signal(nnodes, my_node);
       ncclGin qp_gin{dev_comm, kGinCombinePutCtx + rdma_qp};
       size_t token_slice_off = 0;
       size_t token_slice_bytes = token_bytes;
@@ -1893,11 +1969,10 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
       // Each contributor signals with its node id after putting its partial
       // into our incoming reduce slot. Only after all contributors arrive can
       // we reduce across node slots.
+      const ncclGinSignal_t wait_sig = combine_node_signal(nnodes, node);
       for (int32_t qp = 0; qp < num_qps; ++qp) {
-        const ncclGinSignal_t wait_sig =
-            combine_node_signal(nnodes, node, qp, num_qps);
         ncclGin wait_gin{dev_comm, kGinCombinePutCtx + qp};
-        wait_gin.waitSignal(gin_warp, wait_sig, signal_epoch);
+        wait_gin.waitSignal(gin_warp, wait_sig, kGinSignalStepTarget);
       }
     }
     __threadfence_system();
@@ -2010,7 +2085,6 @@ void detail::combine_internode_cuda_hidden(
   auto local_world_size = args.local_world_size;
   auto num_sm = args.num_sm;
   auto dev_comm_host = args.dev_comm_host;
-  auto signal_epoch = args.signal_epoch;
   auto num_qps = args.num_qps;
   auto dtype = args.dtype;
   auto weight_dtype = args.weight_dtype;
@@ -2101,7 +2175,6 @@ void detail::combine_internode_cuda_hidden(
                                    &rank_arg,
                                    &num_ranks_arg,
                                    &local_world_size_arg,
-                                   &signal_epoch,
                                    &num_qps_arg,
                                    &combine_pipeline_chunks_arg};
             flash_comm::launch_kernel_ex(

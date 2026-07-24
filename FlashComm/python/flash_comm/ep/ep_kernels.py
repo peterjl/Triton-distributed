@@ -303,13 +303,19 @@ class EPKernels:
                              f"root has {root_chunks[0]}")
         gin_signals = max(
             16,
-            _round_up(int(_ep_inter.ep_required_gin_signal_count(nnodes, ep_num_qps)), 16),
+            _round_up(int(_ep_inter.ep_required_gin_signal_count(nnodes)), 16),
         )
         gin_rail_barriers = max(16, self.num_sm)
         gin_queue_depth = 4096
         _buffer.nccl_gin_init(uid[0], self.rank, self.world_size, self.local_world_size,
                               gin_contexts, gin_signals, gin_rail_barriers, gin_queue_depth,
                               int(_buffer.NCCL_GIN_CONNECTION_FULL), ep_num_qps=ep_num_qps)
+        # Context-local EP GIN signal id ranges (see flash_comm/ep/internode.h).
+        # The fused reset+barrier after each dispatch/combine resets its
+        # protocol range on every context.
+        self._dispatch_signal_range = (0, int(_ep_inter.ep_dispatch_signal_count(nnodes)))
+        self._combine_signal_range = (int(_ep_inter.ep_combine_signal_base(nnodes)),
+                                      int(_ep_inter.ep_required_gin_signal_count(nnodes)))
         lsa_size = _buffer.nccl_gin_lsa_size()
         lsa_rank = _buffer.nccl_gin_lsa_rank()
         if lsa_size < self.local_world_size or (lsa_rank % self.local_world_size) != (self.rank %
@@ -616,8 +622,7 @@ class EPKernels:
         return combine_intranode_out_buf, combine_intranode_out_weight_buf
 
     def dispatch_internode(self, input: torch.Tensor, topk_indices: torch.Tensor, topk_weights: Optional[torch.Tensor],
-                           layout_desc: EPCommLayoutDesc):
-        self.ep_group_barrier()
+                           layout_desc: EPCommLayoutDesc, num_qps: Optional[int] = None):
         max_slot_num_token = self.ep_context.config.max_m
         if layout_desc.need_recompute_token_within_expert_offset_and_expert_counts(topk_indices):
             layout_desc.token_within_expert_offset, layout_desc.expert_counts = \
@@ -661,7 +666,6 @@ class EPKernels:
             if layout_desc.num_tokens_per_rank is None:
                 raise ValueError("layout_desc.num_tokens_per_rank is required for internode dispatch reuse")
 
-        self.ep_group_barrier()
         if layout_desc.expert_alignment > 1:
             buf_count_cpu = layout_desc.recv_aligned_token_count_cpu
             buf_count_gpu = layout_desc.recv_aligned_token_count
@@ -698,8 +702,11 @@ class EPKernels:
             topk_weights is not None,
             num_experts_per_rank,
             self.num_sm,
+            num_qps,
         )
-        self.ep_group_barrier()
+        # Fused reset+barrier: dispatch signals are quiescent here and must be
+        # reset before the next dispatch; plain barriers do not touch signals.
+        _ep_inter.reset_signals_barrier_all_on_stream(*self._dispatch_signal_range)
         layout_desc.recv_topk_scatter_indices = self.ep_context.dispatch_topk_scatter_indices_buf[:
                                                                                                   dispatch_recv_token_count]
         dispatch_weights = None
@@ -708,7 +715,7 @@ class EPKernels:
         return (self.ep_context.dispatch_output_buf[:dispatch_recv_token_count], dispatch_weights, layout_desc)
 
     def combine_internode(self, input_preprocessed: torch.Tensor, layout_desc: EPCommLayoutDesc,
-                          weight_preprocessed: Optional[torch.Tensor] = None):
+                          weight_preprocessed: Optional[torch.Tensor] = None, num_qps: Optional[int] = None):
         layout_desc.check_combine_required_inputs()
         assert self._validate_combine_input_buffer(input_preprocessed)
         has_weight = weight_preprocessed is not None
@@ -748,12 +755,14 @@ class EPKernels:
             self.ep_context.config.max_m,
             num_experts_per_rank,
             self.num_sm,
+            num_qps,
         )
-        self.ep_group_barrier()
+        # Fused reset+barrier for the combine signal range (see dispatch).
+        _ep_inter.reset_signals_barrier_all_on_stream(*self._combine_signal_range)
         return combine_out, kernel_combine_weight
 
     def dispatch(self, input: torch.Tensor, topk_indices: torch.Tensor, topk_weights: Optional[torch.Tensor],
-                 layout_desc: EPCommLayoutDesc = None):
+                 layout_desc: EPCommLayoutDesc = None, num_qps: Optional[int] = None):
         # Contract: topk_indices must be in [0, num_experts], where num_experts
         # is the drop sentinel.  Negative values are not a supported sentinel.
         if layout_desc is None:
@@ -766,9 +775,11 @@ class EPKernels:
                                           max_slot_num_token=self.ep_context.config.max_m)
 
         if self.ep_context.config.nnodes == 1:
+            # num_qps only affects internode RDMA traffic; ignored intranode so
+            # the same caller code runs on a single node.
             return self.dispatch_intranode(input, topk_indices, topk_weights, layout_desc)
         else:
-            return self.dispatch_internode(input, topk_indices, topk_weights, layout_desc)
+            return self.dispatch_internode(input, topk_indices, topk_weights, layout_desc, num_qps=num_qps)
 
     def dispatch_postprocess(self, dispatch_out: torch.Tensor, dispatch_topk_weights: Optional[torch.Tensor],
                              layout_desc: EPCommLayoutDesc, num_sm: int = 0):
@@ -779,10 +790,11 @@ class EPKernels:
         return self.combine_intranode_preprocess(input, layout_desc, weight=weight, zero_copy=zero_copy, num_sm=num_sm)
 
     def combine(self, input_preprocessed: torch.Tensor, layout_desc: EPCommLayoutDesc,
-                weight_preprocessed: Optional[torch.Tensor] = None):
+                weight_preprocessed: Optional[torch.Tensor] = None, num_qps: Optional[int] = None):
         if self.ep_context.config.nnodes == 1:
+            # num_qps ignored intranode (see dispatch).
             return self.combine_intranode(input_preprocessed, layout_desc=layout_desc,
                                           weight_preprocessed=weight_preprocessed)
         else:
             return self.combine_internode(input_preprocessed, layout_desc=layout_desc,
-                                          weight_preprocessed=weight_preprocessed)
+                                          weight_preprocessed=weight_preprocessed, num_qps=num_qps)

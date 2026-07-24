@@ -83,8 +83,7 @@ void validate_init_args(int rank, int nranks, int local_world_size,
   }
   const int nnodes = nranks / local_world_size;
   const int required_ep_signals =
-      ::flash_comm::ep::internode::ep_required_gin_signal_count(nnodes,
-                                                                ep_num_qps);
+      ::flash_comm::ep::internode::ep_required_gin_signal_count(nnodes);
   if (gin_signals < required_ep_signals) {
     throw std::runtime_error("gin_signals is too small for per-chunk dispatch "
                              "and per-QP combine signals");
@@ -96,16 +95,13 @@ void validate_init_args(int rank, int nranks, int local_world_size,
 }
 
 void fill_common_state(NcclGinState &st, int rank, int nranks,
-                       int local_world_size, int gin_contexts, int gin_signals,
-                       int ep_num_qps) {
+                       int local_world_size, int gin_contexts, int ep_num_qps) {
   st.rank = rank;
   st.nranks = nranks;
   st.local_world_size = local_world_size;
   st.nnodes = nranks / local_world_size;
-  st.node_id = rank / local_world_size;
   st.local_rank = rank % local_world_size;
   st.gin_contexts = gin_contexts;
-  st.gin_signals = gin_signals;
   st.ep_num_qps = ep_num_qps;
 }
 
@@ -177,7 +173,7 @@ int nccl_gin_init_rank(const void *uid, int uid_len, int rank, int nranks,
 
   auto &st = g_state;
   fill_common_state(st, rank, nranks, local_world_size, gin_contexts,
-                    gin_signals, ep_num_qps);
+                    ep_num_qps);
 
   try {
     init_comm(st, nccl_id, rank, nranks, local_world_size, gin_contexts,
@@ -218,30 +214,6 @@ const ncclDevComm *nccl_gin_dev_comm() {
 int nccl_gin_lsa_rank() { return nccl_gin_require_state().lsa_rank; }
 
 int nccl_gin_lsa_size() { return nccl_gin_require_state().lsa_size; }
-
-uint64_t nccl_gin_next_dispatch_signal_epoch(uint64_t signal_increments) {
-  std::lock_guard<std::mutex> lock(g_mutex);
-  if (!g_state.initialized) {
-    throw std::runtime_error("NCCL GIN is not initialized");
-  }
-  if (signal_increments == 0) {
-    throw std::runtime_error("signal_increments must be positive");
-  }
-  g_state.dispatch_signal_epoch += signal_increments;
-  return g_state.dispatch_signal_epoch;
-}
-
-uint64_t nccl_gin_next_combine_signal_epoch(uint64_t signal_increments) {
-  std::lock_guard<std::mutex> lock(g_mutex);
-  if (!g_state.initialized) {
-    throw std::runtime_error("NCCL GIN is not initialized");
-  }
-  if (signal_increments == 0) {
-    throw std::runtime_error("signal_increments must be positive");
-  }
-  g_state.combine_signal_epoch += signal_increments;
-  return g_state.combine_signal_epoch;
-}
 
 } // namespace buffer
 } // namespace flash_comm
