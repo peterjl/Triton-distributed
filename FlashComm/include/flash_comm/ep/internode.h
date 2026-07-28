@@ -192,8 +192,7 @@ void compute_dispatch_layout_cuda(
     int32_t num_token, int32_t topk, int32_t num_experts, int32_t rank,
     int32_t num_ranks, int32_t num_sm, int32_t expert_alignment,
     int32_t local_world_size, const void *dev_comm_host,
-    void *full_splits_win_ptr, int32_t *rdma_topk_send_mask,
-    int32_t *rdma_token_dst_scatter_indices, cudaStream_t stream);
+    void *full_splits_win_ptr, cudaStream_t stream);
 
 } // namespace internode
 } // namespace ep

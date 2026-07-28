@@ -23,15 +23,16 @@
 #
 ################################################################################
 
-import torch
-import torch.distributed as dist
 import dataclasses
 import os
 import time
-from typing import Optional
-import flash_comm._C.ep_intranode as _ep
-import flash_comm._C.ep_internode as _ep_inter
+
+import torch
+import torch.distributed as dist
+
 import flash_comm._C.buffer as _buffer
+import flash_comm._C.ep_internode as _ep_inter
+import flash_comm._C.ep_intranode as _ep
 
 from .ep_context import EPContext
 
@@ -41,7 +42,7 @@ _MAX_DISPATCH_PIPELINE_CHUNKS = int(_ep_inter.MAX_DISPATCH_PIPELINE_CHUNKS)
 _MAX_COMBINE_PIPELINE_CHUNKS = int(_ep_inter.MAX_COMBINE_PIPELINE_CHUNKS)
 
 
-def _optional_positive_int_env(name: str) -> Optional[int]:
+def _optional_positive_int_env(name: str) -> int | None:
     value = os.environ.get(name)
     if value is None or value == "":
         return None
@@ -70,61 +71,82 @@ def _round_up(value: int, alignment: int) -> int:
 @dataclasses.dataclass
 class EPCommLayoutDesc:
     # only dependent on local topk_indices, can be computed in advance
-    token_within_expert_offset: Optional[torch.Tensor] = None  # [num_tokens, topk]
-    expert_counts: Optional[torch.Tensor] = None  # [num_experts + 1]
+    token_within_expert_offset: torch.Tensor | None = None  # [num_tokens, topk]
+    expert_counts: torch.Tensor | None = None  # [num_experts + 1]
 
     # dispatch layout
-    recv_base_offset: Optional[torch.Tensor] = None  # [world_size, experts_per_rank, world_size]
+    recv_base_offset: torch.Tensor | None = None  # [world_size, experts_per_rank, world_size]
 
-    # token_dst_scatter_indices / recv_topk_scatter_indices both store "positions in the dispatch output buffer".
+    # ------------------------------------------------------------------
+    # Send plan (SENDER-side, [num_token, topk]).
     #
-    # - token_dst_scatter_indices: sender-token space mapping.
-    #   Shape: [num_token, topk] (intranode).
-    #   For each local input token t and its k-th expert choice:
-    #     token_dst_scatter_indices[t, k] is the slot index inside the *target rank's* dispatch receive buffer
-    #     where this (token, expert-choice) should be written during dispatch.
+    # These are pure outputs of compute_dispatch_layout: they depend only on the
+    # local routing and are indexed by *sender-side* input-token rows. They are
+    # the layout's persistent send plan and MUST NOT be overwritten by dispatch.
     #
-    # - recv_topk_scatter_indices: receiver-token space mapping.
-    #   Shape: [num_recv_token, topk] (intranode), where num_recv_token = recv_token_count[rank].
-    #   For each token row r in *this rank's* dispatch receive buffer and its k-th lane:
-    #     recv_topk_scatter_indices[r, k] stores the "scatter index" used by dispatch_postprocess/combine to
-    #     relate received rows back to the original token ordering (and/or to compute dispatch_weights).
+    # - token_dst_scatter_indices[t, k]: slot index inside the *target rank's*
+    #   dispatch receive buffer where local token t's k-th expert-choice lands.
+    # - token_topk_send_mask[t, k]: whether local token t's k-th choice is
+    #   physically sent (0 when a same-target earlier choice already covers it).
+    # - topk_indices[t, k]: the local routing (intranode combine consumes it;
+    #   internode combine uses node_topk_indices instead).
     #
-    # In short:
-    # - token_dst_scatter_indices is indexed by *sender-side* token rows (pre-dispatch).
-    # - recv_topk_scatter_indices is indexed by *receiver-side* token rows (post-dispatch).
-    # Both refer to offsets/slots in the dispatch receive buffers, but their index space (and thus shape) differs.
-    token_dst_scatter_indices: Optional[
-        torch.Tensor] = None  # intranode: [num_token, topk]; internode: [nnodes, max_tokens, topk]
-    token_topk_send_mask: Optional[
-        torch.Tensor] = None  # intranode: [num_token, topk]; internode: [nnodes, max_tokens, topk]
-    topk_indices: Optional[torch.Tensor] = None  # intranode: [num_token, topk]; internode: [nnodes, max_tokens, topk]
-    recv_token_count_cpu: Optional[torch.Tensor] = None  # [world_size] pinned CPU memory (unaligned)
-    recv_token_count: Optional[torch.Tensor] = None  # [world_size] device memory (unaligned)
+    # Intranode dispatch/combine consume these directly. Internode dispatch
+    # copies token_dst_scatter_indices / token_topk_send_mask into the RDMA rail
+    # source slot every call (see dispatch_internode), which is what the NIC
+    # actually reads -- the layout kernel no longer stages the RDMA slot.
+    #
+    # recv_topk_scatter_indices is the RECEIVER-side counterpart ([num_recv_token,
+    # topk]); it is filled post-dispatch and relates received rows back to the
+    # original token ordering for postprocess/combine.
+    token_dst_scatter_indices: torch.Tensor | None = None  # [num_token, topk] sender-side
+    token_topk_send_mask: torch.Tensor | None = None  # [num_token, topk] sender-side
+    topk_indices: torch.Tensor | None = None  # [num_token, topk] local routing (intranode combine)
+
+    # ------------------------------------------------------------------
+    # Per-source-node receive metadata (RECEIVER-side, [nnodes, max_tokens, topk]).
+    #
+    # Internode-only. These are OUTPUTS of dispatch_internode (the consumer warp
+    # writes what it actually applied) and INPUTS to combine_internode. They are
+    # a distinct index space from the send plan above -- do not conflate the two.
+    node_topk_indices: torch.Tensor | None = None  # [nnodes, max_tokens, topk]
+    node_topk_send_mask: torch.Tensor | None = None  # [nnodes, max_tokens, topk]
+    node_token_dst_scatter_indices: torch.Tensor | None = None  # [nnodes, max_tokens, topk]
+
+    recv_token_count_cpu: torch.Tensor | None = None  # [world_size] CPU snapshot (layout-private, unaligned)
+    recv_token_count: torch.Tensor | None = None  # [world_size] device memory (unaligned)
     # Internode-only: per-rank source token counts written by compute_dispatch_layout.
     # This is layout data for the current dispatch, not persistent communication state.
-    num_tokens_per_rank: Optional[torch.Tensor] = None  # [world_size] device memory
-    recv_aligned_token_count_cpu: Optional[torch.Tensor] = None  # [world_size] pinned CPU (aligned, for buffer alloc)
-    recv_aligned_token_count: Optional[torch.Tensor] = None  # [world_size] device (aligned, for postprocess/combine)
-    recv_expert_counts: Optional[torch.Tensor] = None  # [experts_per_rank] per-expert actual token counts
+    num_tokens_per_rank: torch.Tensor | None = None  # [world_size] device memory
+    recv_aligned_token_count_cpu: torch.Tensor | None = None  # [world_size] pinned CPU (aligned, for buffer alloc)
+    recv_aligned_token_count: torch.Tensor | None = None  # [world_size] device (aligned, for postprocess/combine)
+    recv_expert_counts: torch.Tensor | None = None  # [experts_per_rank] per-expert actual token counts
     expert_alignment: int = 1
     num_tokens: int = -1
-    recv_topk_scatter_indices: Optional[
-        torch.Tensor] = None  # intranode: [num_recv_token, topk], internode: [nnodes, max_tokens, topk]
+    recv_topk_scatter_indices: torch.Tensor | None = None  # [num_recv_token, topk] receiver-side
     # Optional receiver-view metadata filled by compute_dispatch_layout for
     # CuTeDSL pull dispatch / push combine overlap paths.
-    token_src_rank_topk_and_indices: Optional[torch.Tensor] = None  # [num_recv_token] int64
+    token_src_rank_topk_and_indices: torch.Tensor | None = None  # [num_recv_token] int64
 
     def check_combine_required_inputs(self):
+        # Intranode combine consumes the sender-side send plan directly.
         if self.token_topk_send_mask is None or self.token_dst_scatter_indices is None:
             raise ValueError("token_topk_send_mask and token_dst_scatter_indices must be provided")
 
-    def need_recompute_token_within_expert_offset_and_expert_counts(self, topk_indices: Optional[torch.Tensor] = None):
+    def check_internode_combine_required_inputs(self):
+        # Internode combine consumes the per-source-node receive metadata produced
+        # by the preceding dispatch_internode, not the sender-side send plan.
+        if (self.node_topk_indices is None or self.node_topk_send_mask is None
+                or self.node_token_dst_scatter_indices is None):
+            raise ValueError(
+                "node_topk_indices / node_topk_send_mask / node_token_dst_scatter_indices must be provided; "
+                "run dispatch_internode before combine_internode")
+
+    def need_recompute_token_within_expert_offset_and_expert_counts(self, topk_indices: torch.Tensor | None = None):
         if self.token_within_expert_offset is None or self.expert_counts is None:
             return True
-        if topk_indices is not None and tuple(self.token_within_expert_offset.shape) != tuple(topk_indices.shape):
-            return True
-        return False
+        return bool(topk_indices is not None
+                    and tuple(self.token_within_expert_offset.shape) != tuple(topk_indices.shape))
 
     def need_recompute_dispatch_layout(self, expert_alignment: int = 1, num_tokens: int = -1):
         if (self.recv_base_offset is None or self.token_dst_scatter_indices is None or self.token_topk_send_mask is None
@@ -135,10 +157,8 @@ class EPCommLayoutDesc:
             return True
         if num_tokens >= 0 and self.num_tokens != num_tokens:
             return True
-        if expert_alignment > 1:
-            if self.recv_aligned_token_count_cpu is None or self.recv_aligned_token_count is None:
-                return True
-        return False
+        return (expert_alignment > 1
+                and (self.recv_aligned_token_count_cpu is None or self.recv_aligned_token_count is None))
 
     def check_layout_desc(
         self,
@@ -146,7 +166,7 @@ class EPCommLayoutDesc:
         topk: int,
         num_experts: int,
         world_size: int = 1,
-        local_world_size: Optional[int] = None,
+        local_world_size: int | None = None,
         max_slot_num_token: int = -1,
     ):
         if num_tokens < 0:
@@ -172,30 +192,23 @@ class EPCommLayoutDesc:
                                  f"got {max_slot_num_token}")
             return (nnodes, max_slot_num_token, topk)
 
-        def check_shape(tensor: Optional[torch.Tensor], name: str, expected_shape):
+        def check_shape(tensor: torch.Tensor | None, name: str, expected_shape):
             if tensor is not None and tuple(tensor.shape) != tuple(expected_shape):
                 raise ValueError(f"{name} must have shape {list(expected_shape)}, got shape {tuple(tensor.shape)}")
 
-        def check_token_topk_shape(tensor: Optional[torch.Tensor], name: str):
+        def check_node_metadata_shape(tensor: torch.Tensor | None, name: str):
+            # Per-source-node receive metadata is internode-only and always rank-3.
             if tensor is None:
                 return
-            if tensor.dim() == 2:
-                if nnodes > 1:
-                    raise ValueError(f"{name} must be rank-3 for internode layout, got shape {tuple(tensor.shape)}")
-                expected = (layout_num_tokens, topk)
-                if tuple(tensor.shape) != expected:
-                    raise ValueError(f"{name} must have shape {list(expected)}, got shape {tuple(tensor.shape)}")
-            elif tensor.dim() == 3:
-                if nnodes <= 1:
-                    raise ValueError(f"{name} must be rank-2 for intranode layout, got shape {tuple(tensor.shape)}")
-                expected = internode_metadata_shape(name)
-                if tuple(tensor.shape) != expected:
-                    raise ValueError(f"{name} must have shape {list(expected)} for internode layout, "
-                                     f"got shape {tuple(tensor.shape)}")
-            else:
-                raise ValueError(f"{name} must be rank-2 or rank-3, got shape {tuple(tensor.shape)}")
+            if nnodes <= 1:
+                raise ValueError(f"{name} is internode-only metadata but nnodes={nnodes}; "
+                                 f"got shape {tuple(tensor.shape)}")
+            expected = internode_metadata_shape(name)
+            if tuple(tensor.shape) != expected:
+                raise ValueError(f"{name} must have shape {list(expected)} for internode layout, "
+                                 f"got shape {tuple(tensor.shape)}")
 
-        def check_recv_topk_scatter_shape(tensor: Optional[torch.Tensor], name: str):
+        def check_recv_topk_scatter_shape(tensor: torch.Tensor | None, name: str):
             if tensor is None:
                 return
             if tensor.dim() == 2:
@@ -220,9 +233,14 @@ class EPCommLayoutDesc:
         check_shape(self.token_within_expert_offset, "token_within_expert_offset", (layout_num_tokens, topk))
         check_shape(self.expert_counts, "expert_counts", (num_experts + 1, ))
         check_shape(self.recv_base_offset, "recv_base_offset", (world_size, experts_per_rank, world_size))
-        check_token_topk_shape(self.token_dst_scatter_indices, "token_dst_scatter_indices")
-        check_token_topk_shape(self.token_topk_send_mask, "token_topk_send_mask")
-        check_token_topk_shape(self.topk_indices, "topk_indices")
+        # Sender-side send plan: always [num_token, topk].
+        check_shape(self.token_dst_scatter_indices, "token_dst_scatter_indices", (layout_num_tokens, topk))
+        check_shape(self.token_topk_send_mask, "token_topk_send_mask", (layout_num_tokens, topk))
+        check_shape(self.topk_indices, "topk_indices", (layout_num_tokens, topk))
+        # Per-source-node receive metadata: internode-only, [nnodes, max_slot_num_token, topk].
+        check_node_metadata_shape(self.node_topk_indices, "node_topk_indices")
+        check_node_metadata_shape(self.node_topk_send_mask, "node_topk_send_mask")
+        check_node_metadata_shape(self.node_token_dst_scatter_indices, "node_token_dst_scatter_indices")
         check_shape(self.recv_token_count_cpu, "recv_token_count_cpu", (world_size, ))
         check_shape(self.recv_token_count, "recv_token_count", (world_size, ))
         check_shape(self.recv_aligned_token_count_cpu, "recv_aligned_token_count_cpu", (world_size, ))
@@ -377,7 +395,7 @@ class EPKernels:
 
         return cur_output_token_num, max_output_token_num
 
-    def dispatch_intranode(self, input: torch.Tensor, topk_indices: torch.Tensor, topk_weights: Optional[torch.Tensor],
+    def dispatch_intranode(self, input: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor | None,
                            layout_desc: EPCommLayoutDesc):
         self.ep_group_barrier()
         # recompute if not provided
@@ -386,7 +404,11 @@ class EPKernels:
                 self.compute_stable_local_token_within_expert_offset_and_expert_counts(topk_indices, self.num_sm)
 
         num_token = input.shape[0]
-        if layout_desc.need_recompute_dispatch_layout(self.expert_alignment, num_token):
+        recompute = layout_desc.need_recompute_dispatch_layout(self.expert_alignment, num_token)
+        if recompute:
+            # compute_dispatch_layout allocates the recv-count buffers fresh and
+            # hands ownership to the layout (nothing shared through ep_context), so
+            # a later dispatch cannot clobber this layout's counts.
             (
                 layout_desc.recv_base_offset,
                 layout_desc.token_dst_scatter_indices,
@@ -406,7 +428,6 @@ class EPKernels:
                 self.ep_context.config.rank,
                 self.ep_context.config.world_size,
                 self.num_sm,
-                self.ep_context.recv_token_count_cpu,
                 token_src_rank_topk_and_indices_ptrs=None,
                 expert_alignment=self.expert_alignment,
             )
@@ -444,7 +465,7 @@ class EPKernels:
             dispatch_weights = self.ep_context.dispatch_topk_weights_buf[:dispatch_recv_token_count]
         return (self.ep_context.dispatch_output_buf[:dispatch_recv_token_count], dispatch_weights, layout_desc)
 
-    def dispatch_intranode_postprocess(self, dispatch_out: torch.Tensor, dispatch_topk_weights: Optional[torch.Tensor],
+    def dispatch_intranode_postprocess(self, dispatch_out: torch.Tensor, dispatch_topk_weights: torch.Tensor | None,
                                        layout_desc: EPCommLayoutDesc, num_sm: int = 0):
         if num_sm <= 0:
             num_sm = torch.cuda.get_device_properties("cuda").multi_processor_count * 8
@@ -504,7 +525,7 @@ class EPKernels:
             _ep_inter.barrier_all_on_stream()
 
     def compute_stable_local_token_within_expert_offset_and_expert_counts(self, topk_indices: torch.Tensor, num_sm=-1):
-        token_within_expert_offset, block_cumsum_hist, expert_counts = _ep.compute_stable_local_token_within_expert_offset_and_expert_counts(
+        token_within_expert_offset, _block_cumsum_hist, expert_counts = _ep.compute_stable_local_token_within_expert_offset_and_expert_counts(
             topk_indices, self.ep_context.config.num_experts, num_sm)
         return token_within_expert_offset, expert_counts
 
@@ -543,7 +564,7 @@ class EPKernels:
         return self._buffer_in_range(tensor, self.ep_context.combine_topk_weights_buf)
 
     def combine_intranode_preprocess(self, input: torch.Tensor, layout_desc: EPCommLayoutDesc,
-                                     weight: Optional[torch.Tensor] = None, zero_copy: bool = False, num_sm: int = 0):
+                                     weight: torch.Tensor | None = None, zero_copy: bool = False, num_sm: int = 0):
         if num_sm <= 0:
             num_sm = torch.cuda.get_device_properties("cuda").multi_processor_count * 8
 
@@ -583,7 +604,7 @@ class EPKernels:
         return combine_input_buf, combine_input_weight_buf
 
     def combine_intranode(self, input_preprocessed: torch.Tensor, layout_desc: EPCommLayoutDesc,
-                          weight_preprocessed: Optional[torch.Tensor] = None):
+                          weight_preprocessed: torch.Tensor | None = None):
         layout_desc.check_combine_required_inputs()
         assert self._validate_combine_input_buffer(input_preprocessed)
         has_weight = weight_preprocessed is not None
@@ -621,8 +642,8 @@ class EPKernels:
         self.ep_group_barrier()
         return combine_intranode_out_buf, combine_intranode_out_weight_buf
 
-    def dispatch_internode(self, input: torch.Tensor, topk_indices: torch.Tensor, topk_weights: Optional[torch.Tensor],
-                           layout_desc: EPCommLayoutDesc, num_qps: Optional[int] = None):
+    def dispatch_internode(self, input: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor | None,
+                           layout_desc: EPCommLayoutDesc, num_qps: int | None = None):
         max_slot_num_token = self.ep_context.config.max_m
         if layout_desc.need_recompute_token_within_expert_offset_and_expert_counts(topk_indices):
             layout_desc.token_within_expert_offset, layout_desc.expert_counts = \
@@ -635,9 +656,18 @@ class EPKernels:
             self.ep_context.config.topk,
             max_slot_num_token=max_slot_num_token,
         )
-        if layout_desc.need_recompute_dispatch_layout(self.expert_alignment, num_token):
+        recompute = layout_desc.need_recompute_dispatch_layout(self.expert_alignment, num_token)
+        if recompute:
             layout_desc.num_tokens_per_rank = torch.empty((self.ep_context.config.world_size, ), dtype=torch.int32,
                                                           device=input.device)
+            # compute_dispatch_layout is a pure layout function: it derives the
+            # sender-side send plan (token_dst_scatter_indices / token_topk_send_mask)
+            # and the recv counts, but does NOT stage the RDMA rail slot -- that is
+            # done unconditionally below so a reused layout still refreshes the slot.
+            # The recv-count buffers (incl. the pinned recv_token_count_cpu poll
+            # target) are allocated fresh by compute_dispatch_layout and owned by
+            # this layout; nothing is shared through ep_context, so a later dispatch
+            # cannot clobber this layout's counts.
             (
                 layout_desc.recv_base_offset,
                 layout_desc.token_dst_scatter_indices,
@@ -655,10 +685,7 @@ class EPKernels:
                 layout_desc.num_tokens_per_rank,
                 self.ep_context.config.num_experts,
                 self.num_sm,
-                self.ep_context.recv_token_count_cpu,
                 expert_alignment=self.expert_alignment,
-                rdma_topk_send_mask=rdma_rail_send_views["topk_send_mask"],
-                rdma_token_dst_scatter=rdma_rail_send_views["token_dst_scatter"],
             )
             layout_desc.expert_alignment = self.expert_alignment
             layout_desc.num_tokens = num_token
@@ -666,6 +693,9 @@ class EPKernels:
             if layout_desc.num_tokens_per_rank is None:
                 raise ValueError("layout_desc.num_tokens_per_rank is required for internode dispatch reuse")
 
+        # Poll the layout-private recv-count buffer. On reuse it already holds the
+        # final counts (poll returns immediately); on recompute it is the fresh
+        # pinned buffer the layout kernel is writing.
         if layout_desc.expert_alignment > 1:
             buf_count_cpu = layout_desc.recv_aligned_token_count_cpu
             buf_count_gpu = layout_desc.recv_aligned_token_count
@@ -674,16 +704,27 @@ class EPKernels:
             buf_count_gpu = layout_desc.recv_token_count
         dispatch_recv_token_count, _ = self._realloc_dispatch_output_buf(buf_count_cpu, buf_count_gpu)
 
-        num_experts_per_rank = self.ep_context.config.num_experts // self.ep_context.config.world_size
-        max_recv_tokens = self.ep_context.dispatch_output_buf.shape[0]
-        meta_shape = (self.ep_context.config.nnodes, max_slot_num_token, self.ep_context.config.topk)
-        layout_desc.topk_indices = torch.empty(meta_shape, dtype=topk_indices.dtype, device=topk_indices.device)
-        layout_desc.token_topk_send_mask = torch.empty(meta_shape, dtype=torch.int32, device=topk_indices.device)
-        layout_desc.token_dst_scatter_indices = torch.empty(meta_shape, dtype=torch.int32, device=topk_indices.device)
+        # Stage the RDMA rail source slot for THIS dispatch. x / topk_indices /
+        # topk_weights were always staged here; the send plan (mask/scatter) must be
+        # staged the same way so a reused layout does not read a previous dispatch's
+        # stale slot metadata. Slot meta offsets are keyed by num_token, so staging
+        # with the current views is correct for any token count.
         rdma_rail_send_views["x"].copy_(input)
         rdma_rail_send_views["topk_indices"].copy_(topk_indices)
+        rdma_rail_send_views["topk_send_mask"].copy_(layout_desc.token_topk_send_mask)
+        rdma_rail_send_views["token_dst_scatter"].copy_(layout_desc.token_dst_scatter_indices)
         if topk_weights is not None:
             rdma_rail_send_views["topk_weights"].copy_(topk_weights)
+
+        num_experts_per_rank = self.ep_context.config.num_experts // self.ep_context.config.world_size
+        max_recv_tokens = self.ep_context.dispatch_output_buf.shape[0]
+        # Per-source-node receive metadata: dispatch OUTPUTS (consumed by combine).
+        # Distinct from the sender-side send plan above; reallocated each dispatch.
+        meta_shape = (self.ep_context.config.nnodes, max_slot_num_token, self.ep_context.config.topk)
+        layout_desc.node_topk_indices = torch.empty(meta_shape, dtype=topk_indices.dtype, device=topk_indices.device)
+        layout_desc.node_topk_send_mask = torch.empty(meta_shape, dtype=torch.int32, device=topk_indices.device)
+        layout_desc.node_token_dst_scatter_indices = torch.empty(meta_shape, dtype=torch.int32,
+                                                                 device=topk_indices.device)
         self.ep_group_barrier()
         _ep_inter.dispatch_internode(
             self.ep_context.dispatch_output_buf_ptrs,
@@ -693,9 +734,9 @@ class EPKernels:
             self.ep_context.rdma_rail_send_buf,
             self.ep_context.rdma_rail_send_win_handle,
             layout_desc.num_tokens_per_rank,
-            layout_desc.topk_indices,
-            layout_desc.token_topk_send_mask,
-            layout_desc.token_dst_scatter_indices,
+            layout_desc.node_topk_indices,
+            layout_desc.node_topk_send_mask,
+            layout_desc.node_token_dst_scatter_indices,
             max_slot_num_token,
             num_token,
             self.ep_context.config.hidden,
@@ -715,8 +756,8 @@ class EPKernels:
         return (self.ep_context.dispatch_output_buf[:dispatch_recv_token_count], dispatch_weights, layout_desc)
 
     def combine_internode(self, input_preprocessed: torch.Tensor, layout_desc: EPCommLayoutDesc,
-                          weight_preprocessed: Optional[torch.Tensor] = None, num_qps: Optional[int] = None):
-        layout_desc.check_combine_required_inputs()
+                          weight_preprocessed: torch.Tensor | None = None, num_qps: int | None = None):
+        layout_desc.check_internode_combine_required_inputs()
         assert self._validate_combine_input_buffer(input_preprocessed)
         has_weight = weight_preprocessed is not None
         if has_weight:
@@ -734,9 +775,10 @@ class EPKernels:
         weight_ptrs = None
         if layout_desc.num_tokens_per_rank is None:
             raise ValueError("layout_desc.num_tokens_per_rank is required for internode combine")
-        if (layout_desc.topk_indices is None or layout_desc.token_topk_send_mask is None
-                or layout_desc.token_dst_scatter_indices is None):
-            raise ValueError("internode combine requires per-node topk_indices/topk_send_mask/token_dst_scatter")
+        if (layout_desc.node_topk_indices is None or layout_desc.node_topk_send_mask is None
+                or layout_desc.node_token_dst_scatter_indices is None):
+            raise ValueError("internode combine requires per-node "
+                             "node_topk_indices/node_topk_send_mask/node_token_dst_scatter_indices")
         if has_weight:
             weight_ptrs = self.ep_context.combine_topk_weights_buf_ptrs
             kernel_combine_weight = torch.empty((num_token, topk), dtype=self.ep_context.config.weight_dtype,
@@ -748,9 +790,9 @@ class EPKernels:
             self.ep_context.rdma_rail_send_win_handle,
             layout_desc.num_tokens_per_rank,
             combine_out,
-            layout_desc.topk_indices,
-            layout_desc.token_topk_send_mask,
-            layout_desc.token_dst_scatter_indices,
+            layout_desc.node_topk_indices,
+            layout_desc.node_topk_send_mask,
+            layout_desc.node_token_dst_scatter_indices,
             kernel_combine_weight,
             self.ep_context.config.max_m,
             num_experts_per_rank,
@@ -761,8 +803,8 @@ class EPKernels:
         _ep_inter.reset_signals_barrier_all_on_stream(*self._combine_signal_range)
         return combine_out, kernel_combine_weight
 
-    def dispatch(self, input: torch.Tensor, topk_indices: torch.Tensor, topk_weights: Optional[torch.Tensor],
-                 layout_desc: EPCommLayoutDesc = None, num_qps: Optional[int] = None):
+    def dispatch(self, input: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor | None,
+                 layout_desc: EPCommLayoutDesc = None, num_qps: int | None = None):
         # Contract: topk_indices must be in [0, num_experts], where num_experts
         # is the drop sentinel.  Negative values are not a supported sentinel.
         if layout_desc is None:
@@ -781,16 +823,16 @@ class EPKernels:
         else:
             return self.dispatch_internode(input, topk_indices, topk_weights, layout_desc, num_qps=num_qps)
 
-    def dispatch_postprocess(self, dispatch_out: torch.Tensor, dispatch_topk_weights: Optional[torch.Tensor],
+    def dispatch_postprocess(self, dispatch_out: torch.Tensor, dispatch_topk_weights: torch.Tensor | None,
                              layout_desc: EPCommLayoutDesc, num_sm: int = 0):
         return self.dispatch_intranode_postprocess(dispatch_out, dispatch_topk_weights, layout_desc, num_sm)
 
-    def combine_preprocess(self, input: torch.Tensor, layout_desc: EPCommLayoutDesc,
-                           weight: Optional[torch.Tensor] = None, zero_copy: bool = False, num_sm: int = 0):
+    def combine_preprocess(self, input: torch.Tensor, layout_desc: EPCommLayoutDesc, weight: torch.Tensor | None = None,
+                           zero_copy: bool = False, num_sm: int = 0):
         return self.combine_intranode_preprocess(input, layout_desc, weight=weight, zero_copy=zero_copy, num_sm=num_sm)
 
     def combine(self, input_preprocessed: torch.Tensor, layout_desc: EPCommLayoutDesc,
-                weight_preprocessed: Optional[torch.Tensor] = None, num_qps: Optional[int] = None):
+                weight_preprocessed: torch.Tensor | None = None, num_qps: int | None = None):
         if self.ep_context.config.nnodes == 1:
             # num_qps ignored intranode (see dispatch).
             return self.combine_intranode(input_preprocessed, layout_desc=layout_desc,

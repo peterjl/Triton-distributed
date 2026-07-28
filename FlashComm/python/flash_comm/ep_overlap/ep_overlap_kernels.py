@@ -23,8 +23,6 @@
 #
 ################################################################################
 
-from typing import Optional, Tuple
-
 import torch
 
 import flash_comm._C.ep_intranode as _ep
@@ -128,7 +126,7 @@ class EPOverlapKernels:
     # ``_GEMM_CLUSTER_M`` / ``_GEMM_CTA_GROUP`` in ``_ops/_base.py``.
     _MIN_GEMM_NUM_SM: int = 4
 
-    def _resolve_comm_num_sm(self, comm_num_sm: Optional[int]) -> int:
+    def _resolve_comm_num_sm(self, comm_num_sm: int | None) -> int:
         """Validate and resolve a per-call non-GEMM SM budget.
 
         ``None`` means use the full device. Runtime-SM kernels take the
@@ -139,11 +137,10 @@ class EPOverlapKernels:
         n = int(comm_num_sm)
         if n < 1:
             raise ValueError(f"comm_num_sm must be >= 1; got {n}")
-        if n > self._device_sm_count:
-            n = self._device_sm_count
+        n = min(n, self._device_sm_count)
         return n
 
-    def _resolve_gemm_num_sm(self, gemm_num_sm: Optional[int]) -> int:
+    def _resolve_gemm_num_sm(self, gemm_num_sm: int | None) -> int:
         """Validate and resolve the per-call GEMM SM budget.
 
         ``None`` -> full device SM count. Values are clamped at the
@@ -157,8 +154,7 @@ class EPOverlapKernels:
         if n < self._MIN_GEMM_NUM_SM:
             raise ValueError(f"gemm_num_sm must be >= {self._MIN_GEMM_NUM_SM} (cluster "
                              f"size of the M-contig GEMM); got {n}")
-        if n > self._device_sm_count:
-            n = self._device_sm_count
+        n = min(n, self._device_sm_count)
         return n
 
     def clear_cutedsl_cache(self) -> None:
@@ -184,8 +180,8 @@ class EPOverlapKernels:
         self,
         topk_indices: torch.Tensor,
         *,
-        comm_num_sm: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        comm_num_sm: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(token_within_expert_offset, expert_counts)``.
 
         The intermediate block-cumulative histogram is dropped (unused
@@ -234,7 +230,7 @@ class EPOverlapKernels:
             raise ValueError(f"input hidden {input.shape[1]} != configured hidden={cfg.hidden}")
 
     def _ensure_dispatch_layout(self, layout_desc: EPCommLayoutDesc, topk_indices: torch.Tensor, *,
-                                comm_num_sm: Optional[int] = None) -> None:
+                                comm_num_sm: int | None = None) -> None:
         """Idempotently (re)compute the dispatch layout."""
         if layout_desc.need_recompute_token_within_expert_offset_and_expert_counts(topk_indices):
             (layout_desc.token_within_expert_offset,
@@ -274,7 +270,6 @@ class EPOverlapKernels:
             cfg.rank,
             cfg.world_size,
             resolved_comm_num_sm,
-            self.overlap_context.recv_token_count_cpu,
             token_src_rank_topk_and_indices_ptrs=self.overlap_context.token_src_rank_topk_and_indices_buf_ptrs,
             expert_alignment=self.expert_alignment,
         )
@@ -331,9 +326,9 @@ class EPOverlapKernels:
         input: torch.Tensor,
         topk_indices: torch.Tensor,
         layout_desc: EPCommLayoutDesc,
-        topk_weights: Optional[torch.Tensor] = None,
-        comm_num_sm: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, EPCommLayoutDesc]:
+        topk_weights: torch.Tensor | None = None,
+        comm_num_sm: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, EPCommLayoutDesc]:
         """Common preamble for standalone and fused CuTeDSL dispatch.
 
         Stages ``input`` into the symmetric dispatch buffer, refreshes
@@ -384,8 +379,8 @@ class EPOverlapKernels:
     # ------------------------------------------------------------------
 
     def dispatch_cutedsl(self, input: torch.Tensor, topk_indices: torch.Tensor,
-                         layout_desc: Optional[EPCommLayoutDesc] = None, enable_expert_signals: bool = False,
-                         comm_num_sm: Optional[int] = None):
+                         layout_desc: EPCommLayoutDesc | None = None, enable_expert_signals: bool = False,
+                         comm_num_sm: int | None = None):
         """CuTeDSL pull-mode dispatch; returns ``(output, layout_desc)``.
 
         Pull writes land on the local rank only -- the next call's
@@ -435,7 +430,7 @@ class EPOverlapKernels:
 
     def combine_cutedsl(self, input: torch.Tensor, layout_desc: EPCommLayoutDesc = None, *, push_mode: str = "1d",
                         tile_m: int = 128, tile_n: int = 128, profile_stages: bool = False,
-                        comm_num_sm: Optional[int] = None):
+                        comm_num_sm: int | None = None):
         """CuTeDSL push-mode combine.
 
         ``push_mode``: ``"1d"`` or ``"tile"`` (2D blocked push).
@@ -515,7 +510,7 @@ class EPOverlapKernels:
     # ------------------------------------------------------------------
 
     def group_gemm(self, A_padded: torch.Tensor, B: torch.Tensor, problem_sizes_m: torch.Tensor,
-                   output: Optional[torch.Tensor] = None, *, gemm_num_sm: Optional[int] = None) -> torch.Tensor:
+                   output: torch.Tensor | None = None, *, gemm_num_sm: int | None = None) -> torch.Tensor:
         """Standalone per-expert M-contiguous group-GEMM.
 
         Per-expert M must be a multiple of :attr:`cluster_tile_m`
@@ -553,8 +548,8 @@ class EPOverlapKernels:
         layout_desc: EPCommLayoutDesc,
         *,
         run_reduce: bool = True,
-        gemm_num_sm: Optional[int] = None,
-        dispatched_weights: Optional[torch.Tensor] = None,
+        gemm_num_sm: int | None = None,
+        dispatched_weights: torch.Tensor | None = None,
     ):
         """Fused FC2 group-GEMM + push combine.
 
@@ -707,13 +702,13 @@ class EPOverlapKernels:
         input: torch.Tensor,
         topk_indices: torch.Tensor,
         B: torch.Tensor,
-        layout_desc: Optional[EPCommLayoutDesc],
+        layout_desc: EPCommLayoutDesc | None,
         *,
         dispatch_num_stages: int = 1,
-        A_padded: Optional[torch.Tensor] = None,
-        gemm_num_sm: Optional[int] = None,
-        comm_num_sm: Optional[int] = None,
-        topk_weights: Optional[torch.Tensor] = None,
+        A_padded: torch.Tensor | None = None,
+        gemm_num_sm: int | None = None,
+        comm_num_sm: int | None = None,
+        topk_weights: torch.Tensor | None = None,
     ):
         """Fused pull-dispatch + FC1 GEMM overlap kernel.
 
@@ -845,7 +840,7 @@ def _validate_gemm_B(B: torch.Tensor, A_padded: torch.Tensor, experts_per_rank: 
     if int(B.shape[2]) != experts_per_rank:
         raise ValueError(f"{op_name}: B.shape[2] (L={B.shape[2]}) != "
                          f"experts_per_rank ({experts_per_rank})")
-    n, k, l = B.shape
+    n, k, _l = B.shape
     expected = (int(k), 1, int(n) * int(k))
     actual = tuple(int(s) for s in B.stride())
     if actual != expected:

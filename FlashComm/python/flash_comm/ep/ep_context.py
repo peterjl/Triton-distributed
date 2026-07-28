@@ -23,10 +23,11 @@
 #
 ################################################################################
 
+import dataclasses
+
 import torch
 import torch.distributed as dist
-import dataclasses
-from typing import Optional
+
 import flash_comm._C.ep_internode as _ep_inter
 from flash_comm.buffer import SymmetricTensor, free_symmetric_tensors
 
@@ -182,15 +183,11 @@ class EPContext:
     combine_topk_weights_buf: torch.Tensor  # (dispatch_recv_tokens, topk), original topk weights for each token
     combine_topk_weights_buf_ptrs: torch.Tensor  # (local_world_size)
 
-    # recv token count
-    recv_token_count_cpu: torch.Tensor  # (world_size), pinned CPU memory
-    recv_token_count: torch.Tensor  # (world_size), device memory
-
     # internode NCCL GIN resources (None / 0 for single-node)
     full_splits_win_handle: int = 0
-    rdma_rail_send_buf: Optional[torch.Tensor] = None
+    rdma_rail_send_buf: torch.Tensor | None = None
     rdma_rail_send_win_handle: int = 0
-    rdma_rail_send_layout: Optional[RDMARailSendLayout] = None
+    rdma_rail_send_layout: RDMARailSendLayout | None = None
 
     def reallocate_buffers(self, num_alloc_tokens: int, combine_input_reuse: bool = True):
         if num_alloc_tokens <= self.dispatch_output_buf.shape[0]:
@@ -334,9 +331,6 @@ class EPContext:
                                                   dtype=config.offset_dtype, group=group,
                                                   local_world_size=config.local_world_size)
         dispatch_recv_tokens = int((max_m * topk * capacity_coeff + 1023) / 1024 * 1024)
-        recv_token_count_cpu = torch.empty((config.world_size, ), dtype=torch.int32, device="cpu", pin_memory=True)
-        recv_token_count_cpu.fill_(-1)
-        recv_token_count = torch.empty((config.world_size, ), dtype=torch.int32, device="cuda")
         if num_worst_tokens > 0:
             dispatch_recv_tokens = num_worst_tokens
         dispatch_output_symm_tensor = SymmetricTensor(shape=(dispatch_recv_tokens, hidden), dtype=config.token_dtype,
@@ -375,8 +369,7 @@ class EPContext:
                         combine_input_buf=combine_input_symm_tensor.get_local_tensor(),
                         combine_input_buf_ptrs=combine_input_symm_tensor.ptrs,
                         combine_topk_weights_buf=combine_topk_weights_buf,
-                        combine_topk_weights_buf_ptrs=combine_topk_weights_buf_ptrs,
-                        recv_token_count_cpu=recv_token_count_cpu, recv_token_count=recv_token_count)
+                        combine_topk_weights_buf_ptrs=combine_topk_weights_buf_ptrs)
 
         # keep references to SymmetricTensor objects to prevent garbage collection
         # the underlying memory would be freed if these objects are collected
@@ -444,10 +437,6 @@ class EPContext:
         rdma_rail_send_buf = rdma_rail_send_symm_tensor.get_local_tensor()
         rdma_rail_send_win_handle = rdma_rail_send_symm_tensor.get_window_handle()
 
-        recv_token_count_cpu = torch.empty((config.world_size, ), dtype=torch.int32, device="cpu", pin_memory=True)
-        recv_token_count_cpu.fill_(-1)
-        recv_token_count = torch.empty((config.world_size, ), dtype=torch.int32, device="cuda")
-
         # Reuse the original intranode communication buffers inside the local NVLink domain.
         # Internode support only adds NCCL full_splits and RDMA rail-send resources above.
         dispatch_output_symm_tensor = SymmetricTensor(shape=(dispatch_recv_tokens, hidden), dtype=config.token_dtype,
@@ -493,8 +482,6 @@ class EPContext:
             combine_input_buf_ptrs=combine_input_symm_tensor.ptrs,
             combine_topk_weights_buf=combine_topk_weights_buf,
             combine_topk_weights_buf_ptrs=combine_topk_weights_buf_ptrs,
-            recv_token_count_cpu=recv_token_count_cpu,
-            recv_token_count=recv_token_count,
         )
         ctx._symm_tensors = {
             "nvl_barrier": nvl_barrier_symm_tensor,

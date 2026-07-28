@@ -209,8 +209,7 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
                                      // local rank only)
         int32_t num_token, int32_t topk, int32_t num_experts, int32_t rank,
         int32_t num_ranks, int32_t expert_alignment, int32_t local_world_size,
-        ncclDevComm dev_comm, ncclWindow_t full_splits_win,
-        int32_t *rdma_topk_send_mask, int32_t *rdma_token_dst_scatter_indices) {
+        ncclDevComm dev_comm, ncclWindow_t full_splits_win) {
   const int thread_id = threadIdx.x;
   const int block_id = blockIdx.x;
   const int num_block = gridDim.x;
@@ -223,9 +222,6 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
   const int32_t row_stride = num_experts + 2;
   const size_t splits_row_bytes =
       static_cast<size_t>(row_stride) * sizeof(int32_t);
-  const bool write_rdma_rail_send_metadata =
-      rdma_topk_send_mask != nullptr &&
-      rdma_token_dst_scatter_indices != nullptr;
   int32_t *full_splits =
       reinterpret_cast<int32_t *>(ncclGetLocalPointer(full_splits_win, 0));
 
@@ -399,18 +395,8 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
     }
     token_dst_scatter_indices[i] = scatter_idx;
     token_topk_send_mask[i] = need_send;
-    if (write_rdma_rail_send_metadata) {
-      rdma_topk_send_mask[i] = need_send;
-      rdma_token_dst_scatter_indices[i] = scatter_idx;
-    }
   }
 
-  if (write_rdma_rail_send_metadata) {
-    // Every thread that populated the RDMA source metadata must publish its own
-    // writes at system scope before the later dispatch GIN kernel lets the NIC
-    // read this window.
-    __threadfence_system();
-  }
   cooperative_groups::this_grid().sync();
 
   for (int32_t g = block_id; g < num_ranks; g += num_block) {
@@ -518,8 +504,7 @@ void compute_dispatch_layout_cuda(
     int32_t num_token, int32_t topk, int32_t num_experts, int32_t rank,
     int32_t num_ranks, int32_t num_sm, int32_t expert_alignment,
     int32_t local_world_size, const void *dev_comm_host,
-    void *full_splits_win_ptr, int32_t *rdma_topk_send_mask,
-    int32_t *rdma_token_dst_scatter_indices, cudaStream_t stream) {
+    void *full_splits_win_ptr, cudaStream_t stream) {
   ncclDevComm dev_comm = *static_cast<const ncclDevComm *>(dev_comm_host);
   ncclWindow_t full_splits_win =
       reinterpret_cast<ncclWindow_t>(full_splits_win_ptr);
@@ -553,9 +538,7 @@ void compute_dispatch_layout_cuda(
                          &expert_alignment,
                          &local_world_size,
                          &dev_comm,
-                         &full_splits_win,
-                         &rdma_topk_send_mask,
-                         &rdma_token_dst_scatter_indices};
+                         &full_splits_win};
   flash_comm::launch_kernel_ex(
       (void *)kernels::kernel_compute_dispatch_layout<kNumWarps>, grid_dim,
       block_dim, kernel_args, smem_size, stream,

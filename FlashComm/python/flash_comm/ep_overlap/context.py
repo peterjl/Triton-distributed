@@ -23,8 +23,6 @@
 #
 ################################################################################
 
-from typing import Dict, Optional
-
 import torch
 import torch.distributed as dist
 
@@ -77,9 +75,6 @@ class EPOverlapContext:
         # by ops that ``mark_dynamic`` the M dimension.
         self.max_recv_tokens: int = 0
 
-        # Local eager buffers (read/written only by THIS rank).
-        self.recv_token_count_cpu: torch.Tensor = None
-        self.recv_token_count: torch.Tensor = None
         # ``expert_signal_state`` is (2, experts_per_rank) int32:
         # row 0 = producer-ready flags, row 1 = CTA-arrival counters.
         # Single backing tensor so :meth:`reset_expert_signals` issues
@@ -89,38 +84,38 @@ class EPOverlapContext:
         self.expert_signal_counters: torch.Tensor = None
 
         # Lazy CuTeDSL staging buffers.
-        self.dispatch_input_symm_tensor: Optional[SymmetricTensor] = None
-        self.dispatch_input_buf: Optional[torch.Tensor] = None
-        self.dispatch_input_ptrs: Optional[torch.Tensor] = None
+        self.dispatch_input_symm_tensor: SymmetricTensor | None = None
+        self.dispatch_input_buf: torch.Tensor | None = None
+        self.dispatch_input_ptrs: torch.Tensor | None = None
 
         # Optional symmetric weight staging used by the dispatch
         # ``has_weight`` side channel. Lazy-allocated on first use:
         # peers pull (max_m, topk) FP32 weights and the kernel
         # side-writes per-row scalars into the caller-provided local
         # output tensor.
-        self.dispatch_input_weight_symm_tensor: Optional[SymmetricTensor] = None
-        self.dispatch_input_weight_buf: Optional[torch.Tensor] = None
-        self.dispatch_input_weight_ptrs: Optional[torch.Tensor] = None
+        self.dispatch_input_weight_symm_tensor: SymmetricTensor | None = None
+        self.dispatch_input_weight_buf: torch.Tensor | None = None
+        self.dispatch_input_weight_ptrs: torch.Tensor | None = None
 
-        self.combine_output_symm_tensor: Optional[SymmetricTensor] = None
-        self.combine_output_buf: Optional[torch.Tensor] = None
-        self.combine_output_ptrs: Optional[torch.Tensor] = None
+        self.combine_output_symm_tensor: SymmetricTensor | None = None
+        self.combine_output_buf: torch.Tensor | None = None
+        self.combine_output_ptrs: torch.Tensor | None = None
 
-        self.group_gemm_combine_output_symm_tensor: Optional[SymmetricTensor] = None
-        self.group_gemm_combine_output_buf: Optional[torch.Tensor] = None
-        self.group_gemm_combine_output_ptrs: Optional[torch.Tensor] = None
-        self.group_gemm_combine_output_n_out: Optional[int] = None
+        self.group_gemm_combine_output_symm_tensor: SymmetricTensor | None = None
+        self.group_gemm_combine_output_buf: torch.Tensor | None = None
+        self.group_gemm_combine_output_ptrs: torch.Tensor | None = None
+        self.group_gemm_combine_output_n_out: int | None = None
 
         # Optional symmetric output-weight staging used by the
         # group_gemm_combine ``has_weight`` side channel. Lazy-allocated
         # on first use: peers push a 4 B FP32 weight per dispatched row
         # back to the source rank's ``(max_m, topk)`` symmetric slot.
-        self.group_gemm_combine_output_weight_symm_tensor: Optional[SymmetricTensor] = None
-        self.group_gemm_combine_output_weight_buf: Optional[torch.Tensor] = None
-        self.group_gemm_combine_output_weight_ptrs: Optional[torch.Tensor] = None
+        self.group_gemm_combine_output_weight_symm_tensor: SymmetricTensor | None = None
+        self.group_gemm_combine_output_weight_buf: torch.Tensor | None = None
+        self.group_gemm_combine_output_weight_ptrs: torch.Tensor | None = None
 
         # Strong refs so SymmetricTensor GPU allocations survive GC.
-        self._symm_tensors: Dict[str, SymmetricTensor] = {}
+        self._symm_tensors: dict[str, SymmetricTensor] = {}
 
     @classmethod
     def create(cls, *, max_m: int, hidden: int, topk: int, num_experts: int, group: dist.ProcessGroup,
@@ -162,22 +157,6 @@ class EPOverlapContext:
         )
         self.full_splits_buf_ptrs = full_splits_symm.ptrs
         self._symm_tensors["full_splits"] = full_splits_symm
-
-        # Pinned page; layout kernel writes -1 -> real count via two
-        # async copies, so the poll loop sees the latest value without
-        # a CPU-side reset.
-        self.recv_token_count_cpu = torch.empty(
-            (cfg.world_size, ),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        )
-        self.recv_token_count_cpu.fill_(_PENDING_RECV_COUNT_SENTINEL)
-        self.recv_token_count = torch.empty(
-            (cfg.world_size, ),
-            dtype=torch.int32,
-            device="cuda",
-        )
 
         if self.num_worst_tokens > 0:
             dispatch_recv_tokens = self.num_worst_tokens

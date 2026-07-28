@@ -357,9 +357,7 @@ compute_dispatch_layout(
     torch::Tensor num_tokens_per_rank, int32_t num_experts, int32_t num_sm,
     c10::optional<torch::Tensor> optional_recv_token_count_cpu,
     c10::optional<torch::Tensor> optional_recv_token_count,
-    int32_t expert_alignment,
-    c10::optional<torch::Tensor> optional_rdma_topk_send_mask,
-    c10::optional<torch::Tensor> optional_rdma_token_dst_scatter) {
+    int32_t expert_alignment) {
   if (!buffer::nccl_gin_is_initialized()) {
     throw std::runtime_error(
         "NCCL GIN not initialized; call buffer.nccl_gin_init first");
@@ -434,26 +432,12 @@ compute_dispatch_layout(
 
   torch::Tensor recv_expert_counts = torch::empty({experts_per_rank}, opts_i32);
 
-  int32_t *rdma_topk_send_mask_ptr = nullptr;
-  int32_t *rdma_token_dst_scatter_ptr = nullptr;
-  if (optional_rdma_topk_send_mask.has_value() ||
-      optional_rdma_token_dst_scatter.has_value()) {
-    FLASH_CHECK(optional_rdma_topk_send_mask.has_value() &&
-                optional_rdma_token_dst_scatter.has_value());
-    auto rdma_topk_send_mask = optional_rdma_topk_send_mask.value();
-    auto rdma_token_dst_scatter = optional_rdma_token_dst_scatter.value();
-    check_tensor_common(rdma_topk_send_mask, "rdma_topk_send_mask", true,
-                        torch::kInt32, 2);
-    check_tensor_common(rdma_token_dst_scatter, "rdma_token_dst_scatter", true,
-                        torch::kInt32, 2);
-    FLASH_CHECK(rdma_topk_send_mask.sizes() == topk_indices.sizes());
-    FLASH_CHECK(rdma_token_dst_scatter.sizes() == topk_indices.sizes());
-    rdma_topk_send_mask_ptr = rdma_topk_send_mask.data_ptr<int32_t>();
-    rdma_token_dst_scatter_ptr = rdma_token_dst_scatter.data_ptr<int32_t>();
-  }
-
   check_uva_enabled_for_current_device();
 
+  // compute_dispatch_layout is a pure layout function. Staging the RDMA rail
+  // source slot is the caller's responsibility (done every dispatch, so a
+  // reused layout still refreshes the slot); the layout kernel no longer
+  // writes it.
   compute_dispatch_layout_cuda(
       topk_indices.data_ptr<int32_t>(),
       token_within_expert_offset.data_ptr<int32_t>(),
@@ -466,8 +450,7 @@ compute_dispatch_layout(
       recv_aligned_token_count_ptr, recv_expert_counts.data_ptr<int32_t>(),
       num_token, topk, num_experts, rank, num_ranks, num_sm, expert_alignment,
       local_world_size, dev_comm,
-      reinterpret_cast<void *>(full_splits_win_handle), rdma_topk_send_mask_ptr,
-      rdma_token_dst_scatter_ptr, stream);
+      reinterpret_cast<void *>(full_splits_win_handle), stream);
 
   return {recv_base_offset,         token_dst_scatter_indices,
           token_topk_send_mask,     recv_token_count_cpu,
@@ -511,9 +494,7 @@ void bind_internode_ops(py::module &m) {
         py::arg("num_tokens_per_rank"), py::arg("num_experts"),
         py::arg("num_sm"), py::arg("recv_token_count_cpu") = c10::nullopt,
         py::arg("recv_token_count") = c10::nullopt,
-        py::arg("expert_alignment") = 1,
-        py::arg("rdma_topk_send_mask") = c10::nullopt,
-        py::arg("rdma_token_dst_scatter") = c10::nullopt);
+        py::arg("expert_alignment") = 1);
 
   m.def(
       "rdma_rail_send_slot_stride_bytes",
