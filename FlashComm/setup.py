@@ -271,7 +271,7 @@ def get_extension():
         print(f"Using NCCL from {nccl_root} ({nccl_source})")
     else:
         library_dirs_extra = []
-        nccl_version = os.environ.get("CUSTOM_NCCL_VERSION", "2.30.4")
+        nccl_version = os.environ.get("CUSTOM_NCCL_VERSION", "2.30.7")
         raise RuntimeError("NCCL with device API (nccl_device.h) not found. "
                            f"Install nvidia-nccl-cu13=={nccl_version} or nvidia-nccl-cu12=={nccl_version}, "
                            "or set CUSTOM_NCCL_HOME/NCCL_HOME to headers+lib.")

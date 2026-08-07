@@ -111,7 +111,13 @@ fi
 # --- Install common packages ---
 echo "Installing common packages: transformers and numpy..."
 pip install transformers==4.51.3 numpy==1.26.4 termcolor
-# deepspeed>=0.19.3 circular-imports with transformers==4.51.3
+# deepspeed is not imported by triton_dist itself, but transformers==4.51.3
+# auto-probes and imports it while loading models (is_deepspeed_available()).
+# deepspeed 0.19.3 eagerly imports transformers.models.opt at package init,
+# which re-enters a still-initializing transformers.modeling_utils and dies with
+# a circular import ("cannot import name 'PreTrainedModel'"). Pin to the last
+# release that imports cleanly with transformers 4.51.3 (0.19.2 verified good;
+# 0.19.3 is the first bad one) instead of always taking latest via --upgrade.
 pip install deepspeed==0.19.2
 
 # --- Define Hugging Face models to download ---

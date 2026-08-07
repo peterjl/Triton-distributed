@@ -127,6 +127,12 @@ class EPCommLayoutDesc:
     # Optional receiver-view metadata filled by compute_dispatch_layout for
     # CuTeDSL pull dispatch / push combine overlap paths.
     token_src_rank_topk_and_indices: torch.Tensor | None = None  # [num_recv_token] int64
+    # Internode-only sender-view metadata. Inter-node CuTeDSL dispatch may
+    # replace token_topk_send_mask/token_dst_scatter_indices with receiver
+    # node-view tensors, but cached layout reuse still needs the original
+    # sender-space tensors to restage the RDMA source slot.
+    internode_sender_topk_send_mask: torch.Tensor | None = None  # [num_tokens, topk]
+    internode_sender_token_dst_scatter_indices: torch.Tensor | None = None  # [num_tokens, topk]
 
     def check_combine_required_inputs(self):
         # Intranode combine consumes the sender-side send plan directly.
@@ -247,6 +253,12 @@ class EPCommLayoutDesc:
         check_shape(self.recv_aligned_token_count, "recv_aligned_token_count", (world_size, ))
         check_shape(self.recv_expert_counts, "recv_expert_counts", (experts_per_rank, ))
         check_shape(self.num_tokens_per_rank, "num_tokens_per_rank", (world_size, ))
+        if self.internode_sender_topk_send_mask is not None:
+            check_shape(self.internode_sender_topk_send_mask, "internode_sender_topk_send_mask",
+                        (layout_num_tokens, topk))
+        if self.internode_sender_token_dst_scatter_indices is not None:
+            check_shape(self.internode_sender_token_dst_scatter_indices, "internode_sender_token_dst_scatter_indices",
+                        (layout_num_tokens, topk))
         check_recv_topk_scatter_shape(self.recv_topk_scatter_indices, "recv_topk_scatter_indices")
 
 
@@ -280,6 +292,7 @@ class EPKernels:
         self.check_num_worst_tokens = check_num_worst_tokens
 
         self.is_internode = self.world_size > local_world_size
+        self._owns_nccl_gin = False
         if self.is_internode:
             self._init_internode_nccl_gin()
 
@@ -296,6 +309,28 @@ class EPKernels:
         torch.distributed.barrier(group=ep_group)
 
     def _init_internode_nccl_gin(self) -> None:
+        if _buffer.nccl_gin_is_initialized():
+            gin_rank = _buffer.nccl_gin_rank()
+            gin_nranks = _buffer.nccl_gin_nranks()
+            gin_local_world_size = _buffer.nccl_gin_local_world_size()
+            if (gin_rank != self.rank or gin_nranks != self.world_size
+                    or gin_local_world_size != self.local_world_size):
+                raise ValueError("Existing NCCL GIN communicator does not match this EP group: "
+                                 f"rank/nranks/local_world_size="
+                                 f"{gin_rank}/{gin_nranks}/{gin_local_world_size}, expected "
+                                 f"{self.rank}/{self.world_size}/{self.local_world_size}")
+            lsa_size = _buffer.nccl_gin_lsa_size()
+            lsa_rank = _buffer.nccl_gin_lsa_rank()
+            if lsa_size < self.local_world_size or (lsa_rank % self.local_world_size) != (self.rank %
+                                                                                          self.local_world_size):
+                raise ValueError("Existing NCCL GIN LSA team must cover local_world_size/local_rank")
+            nnodes = self.world_size // self.local_world_size
+            self._dispatch_signal_range = (0, int(_ep_inter.ep_dispatch_signal_count(nnodes)))
+            self._combine_signal_range = (int(_ep_inter.ep_combine_signal_base(nnodes)),
+                                          int(_ep_inter.ep_required_gin_signal_count(nnodes)))
+            self._owns_nccl_gin = False
+            return
+
         ep_num_qps = _optional_positive_int_env("FLASH_COMM_EP_NUM_QPS") or 1
         gin_contexts = ep_num_qps
 
@@ -334,6 +369,7 @@ class EPKernels:
         self._dispatch_signal_range = (0, int(_ep_inter.ep_dispatch_signal_count(nnodes)))
         self._combine_signal_range = (int(_ep_inter.ep_combine_signal_base(nnodes)),
                                       int(_ep_inter.ep_required_gin_signal_count(nnodes)))
+        self._owns_nccl_gin = True
         lsa_size = _buffer.nccl_gin_lsa_size()
         lsa_rank = _buffer.nccl_gin_lsa_rank()
         if lsa_size < self.local_world_size or (lsa_rank % self.local_world_size) != (self.rank %
@@ -347,8 +383,9 @@ class EPKernels:
                 self.ep_context.release_internode_nccl_resources()
             torch.cuda.synchronize()
             torch.distributed.barrier(group=self.ep_group)
-            if _buffer.nccl_gin_is_initialized():
+            if self._owns_nccl_gin and _buffer.nccl_gin_is_initialized():
                 _buffer.nccl_gin_destroy()
+            self._owns_nccl_gin = False
             torch.cuda.synchronize()
             torch.distributed.barrier(group=self.ep_group)
         # Coordinated, leak-free release of the symmetric buffers. Critical for the

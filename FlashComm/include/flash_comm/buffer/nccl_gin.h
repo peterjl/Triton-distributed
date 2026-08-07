@@ -70,6 +70,9 @@ int nccl_gin_is_initialized();
 NcclGinState &nccl_gin_require_state();
 ncclComm_t nccl_gin_comm();
 const ncclDevComm *nccl_gin_dev_comm();
+int nccl_gin_rank();
+int nccl_gin_nranks();
+int nccl_gin_local_world_size();
 int nccl_gin_lsa_rank();
 int nccl_gin_lsa_size();
 

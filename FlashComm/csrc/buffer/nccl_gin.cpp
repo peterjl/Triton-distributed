@@ -211,6 +211,14 @@ const ncclDevComm *nccl_gin_dev_comm() {
   return &nccl_gin_require_state().dev_comm;
 }
 
+int nccl_gin_rank() { return nccl_gin_require_state().rank; }
+
+int nccl_gin_nranks() { return nccl_gin_require_state().nranks; }
+
+int nccl_gin_local_world_size() {
+  return nccl_gin_require_state().local_world_size;
+}
+
 int nccl_gin_lsa_rank() { return nccl_gin_require_state().lsa_rank; }
 
 int nccl_gin_lsa_size() { return nccl_gin_require_state().lsa_size; }

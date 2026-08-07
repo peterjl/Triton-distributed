@@ -66,7 +66,12 @@ void bind_symmetric_memory(py::module &m) {
       [](const torch::Tensor &uid, int rank, int nranks, int local_world_size,
          int gin_contexts, int gin_signals, int rail_barriers,
          int gin_queue_depth, int gin_connection_type, int ep_num_qps) {
+        FLASH_CHECK(uid.device().is_cpu()) << "uid must be a CPU tensor";
+        FLASH_CHECK(uid.is_contiguous()) << "uid must be contiguous";
         FLASH_CHECK(uid.scalar_type() == torch::kUInt8);
+        FLASH_CHECK(uid.numel() ==
+                    flash_comm::buffer::nccl_gin_unique_id_bytes())
+            << "uid has invalid length";
         return flash_comm::buffer::nccl_gin_init_rank(
             uid.data_ptr(), static_cast<int>(uid.numel()), rank, nranks,
             local_world_size, gin_contexts, gin_signals, rail_barriers,
@@ -82,6 +87,17 @@ void bind_symmetric_memory(py::module &m) {
   m.def("nccl_gin_destroy", &flash_comm::buffer::nccl_gin_destroy_rank);
   m.def("nccl_gin_is_initialized",
         &flash_comm::buffer::nccl_gin_is_initialized);
+  m.def("nccl_gin_dev_comm_bytes", []() {
+    return torch::from_blob(const_cast<ncclDevComm *>(
+                                flash_comm::buffer::nccl_gin_dev_comm()),
+                            {static_cast<int64_t>(sizeof(ncclDevComm))},
+                            torch::kUInt8)
+        .clone();
+  });
+  m.def("nccl_gin_rank", &flash_comm::buffer::nccl_gin_rank);
+  m.def("nccl_gin_nranks", &flash_comm::buffer::nccl_gin_nranks);
+  m.def("nccl_gin_local_world_size",
+        &flash_comm::buffer::nccl_gin_local_world_size);
   m.def("nccl_gin_lsa_rank", &flash_comm::buffer::nccl_gin_lsa_rank);
   m.def("nccl_gin_lsa_size", &flash_comm::buffer::nccl_gin_lsa_size);
 
