@@ -60,7 +60,18 @@ else
 fi
 
 additional_args="--rdzv_endpoint=${master_addr}:${master_port}"
-CMD="torchrun \
+# NOTE(local): mori_shmem's C++ layer reads MASTER_ADDR/MASTER_PORT directly from
+# the environment (it aborts with "requires torchrun/torch.distributed env vars"
+# otherwise). torch.distributed.run's rendezvous path does NOT export those, so
+# set them explicitly for the mori backend.
+export MASTER_ADDR="${master_addr}"
+export MASTER_PORT="${master_port}"
+# NOTE(local): use `python3 -m torch.distributed.run` instead of the `torchrun`
+# console script. torchrun's shebang pins /usr/local/bin/python (system), so its
+# rank subprocesses would run under the system interpreter and miss the venv's
+# hip-python / triton / triton_dist (ModuleNotFoundError: hip). Going through the
+# active python3 keeps every rank inside the venv.
+CMD="python3 -m torch.distributed.run \
   --node_rank=${node_rank} \
   --nproc_per_node=${nproc_per_node} \
   --nnodes=${nnodes} \
