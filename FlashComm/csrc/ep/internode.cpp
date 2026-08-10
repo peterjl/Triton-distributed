@@ -366,7 +366,7 @@ compute_dispatch_layout(
   const int32_t rank = ep_state.rank;
   const int32_t num_ranks = ep_state.nranks;
   const int32_t local_world_size = ep_state.local_world_size;
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
   const void *dev_comm = static_cast<const void *>(buffer::nccl_gin_dev_comm());
 
   check_topk_indices(topk_indices);
@@ -451,6 +451,11 @@ compute_dispatch_layout(
       num_token, topk, num_experts, rank, num_ranks, num_sm, expert_alignment,
       local_world_size, dev_comm,
       reinterpret_cast<void *>(full_splits_win_handle), stream);
+
+  record_pinned_tensor(recv_token_count_cpu, stream);
+  if (expert_alignment > 1) {
+    record_pinned_tensor(recv_aligned_token_count_cpu, stream);
+  }
 
   return {recv_base_offset,         token_dst_scatter_indices,
           token_topk_send_mask,     recv_token_count_cpu,

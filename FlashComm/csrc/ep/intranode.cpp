@@ -143,7 +143,7 @@ compute_dispatch_layout(
     c10::optional<torch::Tensor> optional_recv_token_count,
     c10::optional<torch::Tensor> optional_token_src_rank_topk_and_indices_ptrs,
     int32_t expert_alignment) {
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
   check_topk_indices(topk_indices);
   check_topk_indices(token_within_expert_offset);
   FLASH_CHECK(local_splits.is_cuda() && local_splits.is_contiguous() &&
@@ -261,6 +261,11 @@ compute_dispatch_layout(
       recv_aligned_token_count_ptr, recv_expert_counts_ptr,
       token_src_rank_topk_and_indices_ptrs_data, num_token, topk, num_experts,
       rank, num_ranks, num_sm, expert_alignment, stream);
+
+  record_pinned_tensor(recv_token_count_cpu, stream);
+  if (expert_alignment > 1) {
+    record_pinned_tensor(recv_aligned_token_count_cpu, stream);
+  }
 
   return {recv_base_offset,         token_dst_scatter_indices,
           token_topk_send_mask,     recv_token_count_cpu,

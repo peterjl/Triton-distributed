@@ -317,6 +317,8 @@ def parse_args():
     parser.add_argument("--disable-weight-dispatch", action="store_true", help="disable weight dispatch")
     parser.add_argument("--expert-alignment", default=1, type=int,
                         help="pad each expert's recv buffer to a multiple of this value (default 1 = no padding)")
+    parser.add_argument("--check-pinned-buffer-lifetime", action="store_true",
+                        help="check that dispatch layout pinned buffers remain live until the CUDA stream completes")
     return parser.parse_args()
 
 
@@ -525,6 +527,45 @@ def straggler(rank):
     torch.cuda._sleep(cycles)
 
 
+def check_pinned_buffer_lifetime(ep_kernels, exp_indices):
+    torch.cuda.synchronize()
+    torch.distributed.barrier(group=EP_GROUP)
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        # use `sleep` to defer layout kernel on compute stream.
+        torch.cuda._sleep(2_000_000_000)
+        token_within_expert_offset, expert_counts = \
+            ep_kernels.compute_stable_local_token_within_expert_offset_and_expert_counts(exp_indices)
+        ep_kernels.ep_group_barrier()
+        layout_outputs = _ep.compute_dispatch_layout(
+            exp_indices,
+            token_within_expert_offset,
+            expert_counts,
+            ep_kernels.ep_context.full_splits_buf_ptrs,
+            ep_kernels.ep_context.nvl_barrier_buf_ptrs,
+            ep_kernels.ep_context.config.num_experts,
+            ep_kernels.ep_context.config.rank,
+            ep_kernels.ep_context.config.world_size,
+            ep_kernels.num_sm,
+            expert_alignment=128,
+        )
+
+    recv_count_tensors = (layout_outputs[3], layout_outputs[5])
+    assert all(tensor.is_pinned() for tensor in recv_count_tensors)
+    recv_count_ptrs = {tensor.data_ptr() for tensor in recv_count_tensors}
+    del recv_count_tensors, layout_outputs
+
+    replacement_tensors = [torch.empty((WORLD_SIZE, ), dtype=torch.int32, pin_memory=True) for _ in range(128)]
+    reused_ptrs = recv_count_ptrs.intersection(tensor.data_ptr() for tensor in replacement_tensors)
+
+    stream.synchronize()
+    torch.distributed.barrier(group=EP_GROUP)
+    assert not reused_ptrs, (
+        "dispatch layout pinned recv-count buffers were reused before their CUDA stream completed: "
+        f"{sorted(reused_ptrs)}")
+
+
 if __name__ == "__main__":
     args = parse_args()
     torch.cuda.set_device(LOCAL_RANK)
@@ -568,6 +609,16 @@ if __name__ == "__main__":
     ep_kernels = EPKernels(max_m=args.M, hidden=args.N, topk=args.topk, num_experts=args.G, local_world_size=WORLD_SIZE,
                            ep_group=EP_GROUP, num_sm=args.num_sm, num_worst_tokens=args.num_worst_tokens,
                            expert_alignment=args.expert_alignment)
+
+    if args.check_pinned_buffer_lifetime:
+        _, _, exp_indices = _make_data(min(args.M, 128))
+        check_pinned_buffer_lifetime(ep_kernels, exp_indices)
+        if RANK == 0:
+            print("Pinned dispatch recv-count buffer lifetime check passed.")
+        ep_kernels.finalize()
+        torch.distributed.destroy_process_group(EP_GROUP)
+        torch.distributed.destroy_process_group()
+        exit(0)
 
     def _run_dispatch(input, weight, exp_indices, copy_out=False):
         token_within_expert_offset, expert_counts = ep_kernels.compute_stable_local_token_within_expert_offset_and_expert_counts(
