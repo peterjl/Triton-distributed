@@ -126,6 +126,20 @@ fi
 # ============ Build FlashComm ============
 if [ "$BUILD_FLASHCOMM" -eq 1 ]; then
     echo "========== Building FlashComm =========="
+    # FlashComm needs NCCL device API headers (nccl_device.h). Use the public
+    # PyPI wheel unless NCCL_HOME / CUSTOM_NCCL_HOME already points at a tree.
+    NCCL_VERSION="${NCCL_VERSION:-${CUSTOM_NCCL_VERSION:-2.30.7}}"
+    NCCL_HOME="${NCCL_HOME:-${CUSTOM_NCCL_HOME:-}}"
+    if [ -z "${NCCL_HOME}" ]; then
+        NCCL_PIP_PACKAGE="nvidia-nccl-cu${NVCC_MAJOR_VERSION}"
+        echo "Using NCCL pip package: ${NCCL_PIP_PACKAGE}==${NCCL_VERSION}"
+        pip3 install "${NCCL_PIP_PACKAGE}==${NCCL_VERSION}"
+    else
+        echo "Using NCCL from NCCL_HOME=${NCCL_HOME}"
+        export LIBRARY_PATH="${NCCL_HOME}/lib:${LIBRARY_PATH}"
+        export LD_LIBRARY_PATH="${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
+        export CUSTOM_NCCL_HOME="${NCCL_HOME}"
+    fi
     cd $SCRIPT_DIR/FlashComm
     python3 setup.py bdist_wheel
     cd $SCRIPT_DIR

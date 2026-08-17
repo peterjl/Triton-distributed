@@ -271,10 +271,10 @@ def get_extension():
         print(f"Using NCCL from {nccl_root} ({nccl_source})")
     else:
         library_dirs_extra = []
-        nccl_version = os.environ.get("CUSTOM_NCCL_VERSION", "2.30.7")
+        nccl_version = os.environ.get("NCCL_VERSION", os.environ.get("CUSTOM_NCCL_VERSION", "2.30.7"))
         raise RuntimeError("NCCL with device API (nccl_device.h) not found. "
                            f"Install nvidia-nccl-cu13=={nccl_version} or nvidia-nccl-cu12=={nccl_version}, "
-                           "or set CUSTOM_NCCL_HOME/NCCL_HOME to headers+lib.")
+                           "or set NCCL_HOME/CUSTOM_NCCL_HOME to headers+lib.")
     # Make `-lcuda` resolvable on both x86_64 and aarch64.
     # On many systems only the CUDA stub has `libcuda.so`, while the driver ships `libcuda.so.1`.
     cuda_home = Path(os.getenv("CUDA_HOME", "/usr/local/cuda"))
