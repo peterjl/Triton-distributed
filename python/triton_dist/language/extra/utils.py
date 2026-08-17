@@ -27,6 +27,18 @@ import inspect
 from triton.language import core
 
 
+def _pointer_type_hash(self):
+    return hash((self.name, self.element_ty, "tt_ptr"))
+
+
+def patch_hash_method_for_pointer_type():
+    # Triton pointer_type defines __eq__ but not __hash__, so dict keys fail.
+    elem_dtype_list = (core.dtype.SINT_TYPES + core.dtype.UINT_TYPES + core.dtype.FP_TYPES + core.dtype.OTHER_TYPES)
+    for elem_dtype in elem_dtype_list:
+        ptr_ty = type(core.pointer_type(core.dtype(elem_dtype)))
+        ptr_ty.__hash__ = _pointer_type_hash
+
+
 class ModuleProxy:
 
     def __init__(self, module_list: Dict[Callable, Any]):
