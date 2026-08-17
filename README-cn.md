@@ -39,7 +39,7 @@ Triton-distributed是基于OpenAI Triton构建的分布式编译器，专为计�
 
 使用Triton-distributed，开发者可以创建性能媲美优化库（如NVIDIA的[Distributed-GEMM](https://github.com/NVIDIA/cutlass/tree/main/examples/65_distributed_gemm)和字节跳动的[FLUX](https://github.com/bytedance/flux/blob/main/README.md)）的高效Kernel。当前主要支持NVIDIA GPU和AMD GPU，也可移植到其他硬件平台。如需在自定义硬件上使用，请联系我们。
 
-默认分支跟踪 **Triton 3.7**。此前的 Triton 3.4 线路保留在 [`triton-v3.4`](https://github.com/ByteDance-Seed/Triton-distributed/tree/triton-v3.4) 分支（Ascend 在 triton-ascend rebase 到 3.7 之前继续跟踪该分支）。
+默认分支跟踪 **Triton 3.7**。此前的 Triton 3.4 线路保留在 [`triton-v3.4`](https://github.com/ByteDance-Seed/Triton-distributed/tree/triton-v3.4) 分支。Ascend 尚未接入 3.7 plugin 构建路径（`triton-ascend` 还没有 rebase 到 3.7）；可用的 Ascend 构建请使用 `triton-v3.4`。3.4 时期的 Ascend 源码停放在本分支的 [`ascend/`](ascend/README.md)，待基于 plugin 的移植就绪后再捞回。
 
 ## 快速入门
 ### 源码安装

@@ -41,7 +41,7 @@ Using Triton-distributed, programmers are able to develop efficient kernels comp
 Triton-distributed currently mainly targets Nvidia GPU and AMD GPU. It can also be ported to other hardware platforms.
 Feel free to contact us if you want to use Triton-distributed on your own hardware.
 
-The default branch tracks **Triton 3.7**. The previous Triton 3.4 line is kept on the [`triton-v3.4`](https://github.com/ByteDance-Seed/Triton-distributed/tree/triton-v3.4) branch (Ascend continues to track that branch until triton-ascend rebases onto 3.7).
+The default branch tracks **Triton 3.7**. The previous Triton 3.4 line is kept on the [`triton-v3.4`](https://github.com/ByteDance-Seed/Triton-distributed/tree/triton-v3.4) branch. Ascend is not on the 3.7 plugin build path yet (`triton-ascend` has not rebased onto 3.7); use `triton-v3.4` for a working Ascend build. The 3.4-era Ascend sources are parked under [`ascend/`](ascend/README.md) on this branch until a plugin-based port exists.
 
 ## News
 - 08/17/2026 🚀🚀🚀: Upgraded to Triton 3.7. Triton-distributed now builds as an out-of-tree plugin against stock upstream Triton. The Triton 3.4 line is kept on [`triton-v3.4`](https://github.com/ByteDance-Seed/Triton-distributed/tree/triton-v3.4).
