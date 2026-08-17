@@ -325,12 +325,12 @@ def insert(input: tlc.tensor, scalar, indices, _semantic) -> tlc.tensor:
 #   3. emit the body inside the region's entry block,
 #   4. terminate the body with block_yield (companion create_block_yield_op) and
 #      rebind carried names to the region op's results.
-import ast as _ast
-from triton.compiler import code_generator as _code_generator
-from triton.compiler.code_generator import (enter_sub_region as _enter_sub_region, flatten_values_to_ir as
-                                            _flatten_values_to_ir, unflatten_ir_values as _unflatten_ir_values,
-                                            _is_triton_value)
-from triton.language.core import _unwrap_if_constexpr as _unwrap
+import ast as _ast  # noqa: E402
+from triton.compiler import code_generator as _code_generator  # noqa: E402
+from triton.compiler.code_generator import (  # noqa: E402
+    enter_sub_region as _enter_sub_region, flatten_values_to_ir as _flatten_values_to_ir, unflatten_ir_values as
+    _unflatten_ir_values, _is_triton_value)
+from triton.language.core import _unwrap_if_constexpr as _unwrap  # noqa: E402
 
 _ORIG_VISIT_WITH = None
 

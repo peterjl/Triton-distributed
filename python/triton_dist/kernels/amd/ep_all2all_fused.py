@@ -535,13 +535,14 @@ def create_ep_a2a_fused_context(
     meta_grid_sync = torch.zeros([1], dtype=torch.int32, device=device)
 
     mori_shmem_barrier_all_on_stream(torch.cuda.current_stream())
-    return EpA2AFusedContext(
-        group=group, rank=rank, world_size=world_size, max_tokens=max_tokens, hidden=hidden, topk=topk,
-        num_tot_experts=num_tot_experts, experts_per_rank=experts_per_rank, dtype=dtype, weight_dtype=weight_dtype,
-        capacity=capacity, cap_tokens=cap_tokens, send_buf=send_buf, output_buf=output_buf,
-        barriers_buf=barriers_buf, combine_in_buf=combine_in_buf, local_splits_buf=local_splits_buf,
-        full_splits_buf=full_splits_buf, splits_signal_buf=splits_signal_buf, task_counter=task_counter,
-        expert_counter=expert_counter, combine_grid_sync=combine_grid_sync, meta_grid_sync=meta_grid_sync)
+    return EpA2AFusedContext(group=group, rank=rank, world_size=world_size, max_tokens=max_tokens, hidden=hidden,
+                             topk=topk, num_tot_experts=num_tot_experts, experts_per_rank=experts_per_rank, dtype=dtype,
+                             weight_dtype=weight_dtype, capacity=capacity, cap_tokens=cap_tokens, send_buf=send_buf,
+                             output_buf=output_buf, barriers_buf=barriers_buf, combine_in_buf=combine_in_buf,
+                             local_splits_buf=local_splits_buf, full_splits_buf=full_splits_buf,
+                             splits_signal_buf=splits_signal_buf, task_counter=task_counter,
+                             expert_counter=expert_counter, combine_grid_sync=combine_grid_sync,
+                             meta_grid_sync=meta_grid_sync)
 
 
 def _build_gemm_tiling(split_size: torch.Tensor, block_m: int, device):
@@ -778,7 +779,8 @@ def kernel_build_gemm_tiling(
             tl.store(tile_num_cum_ptr + pid, tile_cumsum)
 
 
-def _build_gemm_tiling_device(split_size: torch.Tensor, block_m: int, epr: int, device, M_local: int, num_sms: int = 64):
+def _build_gemm_tiling_device(split_size: torch.Tensor, block_m: int, epr: int, device, M_local: int,
+                              num_sms: int = 64):
     """Device-kernel version of ``_build_gemm_tiling`` (same dict layout)."""
     # An expert contributes at most cdiv(tokens, block_m) tiles; the +epr bound covers
     # the partial tile of every expert, so M_grid is a safe upper bound on total tiles.
@@ -937,9 +939,8 @@ def fused_dispatch_token_moe_grouped_gemm(
     # ranks fall through into the barrier/kernel while overflowing ranks bail out -> hang.
     max_recv = int(meta["num_recv_tokens_per_rank"].max().item())
     if max_recv > ctx.cap_tokens:
-        raise RuntimeError(
-            f"a rank would receive up to {max_recv} routed tokens > cap_tokens={ctx.cap_tokens}; "
-            "increase `capacity` or `max_tokens`")
+        raise RuntimeError(f"a rank would receive up to {max_recv} routed tokens > cap_tokens={ctx.cap_tokens}; "
+                           "increase `capacity` or `max_tokens`")
     num_sms = min(num_sms, torch.cuda.get_device_properties(device).multi_processor_count)
 
     # stage this rank's tokens into the symmetric send buffer (putmem source)
@@ -1213,9 +1214,8 @@ def fused_group_gemm_combine_token(
     # Global capacity check (see fused_dispatch_token_moe_grouped_gemm): raise on every rank together.
     max_recv = int(meta["num_recv_tokens_per_rank"].max().item())
     if max_recv > ctx.cap_tokens:
-        raise RuntimeError(
-            f"a rank would receive up to {max_recv} routed tokens > cap_tokens={ctx.cap_tokens}; "
-            "increase `capacity` or `max_tokens`")
+        raise RuntimeError(f"a rank would receive up to {max_recv} routed tokens > cap_tokens={ctx.cap_tokens}; "
+                           "increase `capacity` or `max_tokens`")
     num_sms = min(num_sms, torch.cuda.get_device_properties(device).multi_processor_count)
 
     has_gate = topk_weights is not None

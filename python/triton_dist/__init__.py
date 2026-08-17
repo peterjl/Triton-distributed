@@ -31,13 +31,13 @@ from ._plugin import register_plugin as _register_plugin  # noqa: E402
 
 _register_plugin()
 import triton  # noqa: F401,E402
-from packaging.version import Version
+from packaging.version import Version  # noqa: E402
 # yapf: enable
 
-from . import language  # noqa: F401
-from .jit import jit  # noqa: F401
-from .tools.monkey_inductor import apply_triton340_inductor_patch  # noqa: F401
-from .tools.monkey_inductor import TORCH_VERSION
+from . import language  # noqa: F401, E402
+from .jit import jit  # noqa: F401, E402
+from .tools.monkey_inductor import apply_triton340_inductor_patch  # noqa: F401, E402
+from .tools.monkey_inductor import TORCH_VERSION  # noqa: E402
 
 triton_version = Version(triton.__version__)
 require_patched_torch = (Version("2.7.0a0") <= TORCH_VERSION < Version("2.8.1"))
