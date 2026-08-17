@@ -14,9 +14,11 @@ CUSTOM_NCCL_HOME="${CUSTOM_NCCL_HOME:-}"
 CALL_DIR="$(pwd -P)"
 
 if [ -n "${CUSTOM_NCCL_SCM_VERSION}" ]; then
-  echo "Cloning NCCL SCM version ${CUSTOM_NCCL_SCM_VERSION} into ${CALL_DIR}/nccl"
-  (cd "${CALL_DIR}" && bvc clone data/rdma/nccl --version "${CUSTOM_NCCL_SCM_VERSION}")
-  export CUSTOM_NCCL_HOME="${CALL_DIR}/nccl"
+  echo "CUSTOM_NCCL_SCM_VERSION is set; provide a local NCCL tree via CUSTOM_NCCL_HOME instead of cloning." >&2
+  if [ -z "${CUSTOM_NCCL_HOME}" ]; then
+    echo "CUSTOM_NCCL_HOME is required when CUSTOM_NCCL_SCM_VERSION is set." >&2
+    exit 1
+  fi
 fi
 
 CUDA_MAJOR="$("${CUDA_HOME}/bin/nvcc" --version | sed -n 's/.*release \([0-9][0-9]*\)\..*/\1/p' | head -n 1)"

@@ -177,8 +177,8 @@ def locate_triton() -> dict:
     if install_dir or source_dir:
         # Compiling against a Triton *source* tree needs its tablegen'd *.inc
         # headers, which live in the CMake build dir (not include/). Callers that
-        # set TRITON_SOURCE_DIR but not TRITON_BUILD_DIR (e.g. the two-step CI
-        # build in .codebase/scripts/nvidia/build.sh) would otherwise leave
+        # set TRITON_SOURCE_DIR but not TRITON_BUILD_DIR (e.g. a two-step CI
+        # build that compiles Triton first) would otherwise leave
         # build_dir=None, so -DTRITON_BUILD_DIR is never passed and the plugin
         # fails to find e.g. AttrInterfaces.h.inc. Discover it the same way the
         # `import triton` branch below does.
