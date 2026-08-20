@@ -23,6 +23,8 @@
 #
 ################################################################################
 
+import os
+import time
 from typing import Optional, Tuple
 
 import torch
@@ -68,6 +70,12 @@ class EPOverlapKernels:
         self.num_worst_tokens = int(num_worst_tokens)
         self.check_num_worst_tokens = bool(check_num_worst_tokens)
         self.capacity_coeff = float(capacity)
+        self._finalized = False
+        cpu_poll_sleep_us = int(os.environ.get("FLASH_COMM_EP_CPU_POLL_SLEEP_US", "50"))
+        if cpu_poll_sleep_us < 0:
+            raise ValueError(f"FLASH_COMM_EP_CPU_POLL_SLEEP_US must be >= 0, got {cpu_poll_sleep_us}")
+        self.cpu_poll_sleep_us = cpu_poll_sleep_us
+        self.cpu_poll_sleep_s = cpu_poll_sleep_us / 1_000_000
 
         self.overlap_context = EPOverlapContext.create(
             max_m=max_m,
@@ -186,7 +194,40 @@ class EPOverlapKernels:
         self.cutedsl_cache.clear()
 
     def finalize(self) -> None:
-        self.overlap_context.release_internode_nccl_resources()
+        """Collectively retire kernels and release all EP-overlap resources.
+
+        Every rank in ``ep_group`` must call this in the same order. Teardown is
+        explicit rather than ``__del__`` because Python GC cannot safely run a
+        cross-rank barrier or coordinate NCCL window/communicator destruction.
+        """
+        if self._finalized:
+            return
+        ctx = self.overlap_context
+        if ctx.config.nnodes > 1:
+            ctx.release_internode_nccl_resources()
+            torch.cuda.synchronize()
+            torch.distributed.barrier(group=self.ep_group)
+            ctx.destroy_internode_nccl_gin()
+            torch.cuda.synchronize()
+            torch.distributed.barrier(group=self.ep_group)
+
+        # Raw VMM/CUDA-IPC backends free immediately, so explicitly retire every
+        # stream and rank before dropping peer mappings. This also makes lazy and
+        # resized buffers obey the same lifecycle as eager allocations.
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=self.ep_group)
+        ctx.free_buffers()
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=self.ep_group)
+        self._finalized = True
+
+    close = finalize
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.finalize()
 
     # ------------------------------------------------------------------
     # Low-level CUDA building blocks.
@@ -281,7 +322,8 @@ class EPOverlapKernels:
 
         cfg = self.overlap_context.config
         num_tokens = int(topk_indices.shape[0])
-        if not layout_desc.need_recompute_dispatch_layout(self.expert_alignment, num_tokens):
+        recompute = layout_desc.need_recompute_dispatch_layout(self.expert_alignment, num_tokens)
+        if not recompute:
             if cfg.nnodes > 1:
                 if layout_desc.num_tokens_per_rank is None:
                     raise ValueError("layout_desc.num_tokens_per_rank is required for internode dispatch layout reuse")
@@ -315,7 +357,7 @@ class EPOverlapKernels:
                 cfg.rank,
                 cfg.world_size,
                 resolved_comm_num_sm,
-                token_src_rank_topk_and_indices_ptrs=self.overlap_context.token_src_rank_topk_and_indices_buf_ptrs,
+                token_src_rank_topk_and_indices_ptrs=(self.overlap_context.token_src_rank_topk_and_indices_buf_ptrs),
                 expert_alignment=self.expert_alignment,
             )
         else:
@@ -407,39 +449,70 @@ class EPOverlapKernels:
         self,
         recv_token_count_cpu: torch.Tensor,
         recv_token_count: torch.Tensor,
-    ) -> int:
+    ) -> Tuple[int, int]:
         """Busy-wait until the layout kernel publishes the recv count.
 
-        ``num_worst_tokens > 0`` short-circuits to the user-supplied
-        bound. The recv count is also asserted against
-        ``ctx.max_recv_tokens`` so we fail loudly instead of corrupting
-        the pre-allocated symmetric meta buffer.
+        Returns ``(this_rank_count, all_rank_max)``. For a fixed positive
+        ``num_worst_tokens`` the configured bound is returned without a CPU
+        poll, matching :class:`EPKernels`.
         """
         if not recv_token_count_cpu.is_cpu:
             raise ValueError("recv_token_count_cpu must be a CPU pinned tensor")
         if recv_token_count_cpu.dtype != torch.int32:
             raise TypeError("recv_token_count_cpu must be int32; got "
                             f"{recv_token_count_cpu.dtype}")
-        ctx = self.overlap_context
-
         if self.num_worst_tokens > 0:
             if self.check_num_worst_tokens:
                 torch._assert_async(
                     recv_token_count[self.rank] <= self.num_worst_tokens,
                     f"num_worst_tokens = {self.num_worst_tokens} is not valid",
                 )
-            return int(self.num_worst_tokens)
+            return int(self.num_worst_tokens), int(self.num_worst_tokens)
 
         arr = recv_token_count_cpu.numpy()
         while int(arr.min()) == _PENDING_RECV_COUNT_SENTINEL:
-            pass
+            if self.cpu_poll_sleep_us > 0:
+                time.sleep(self.cpu_poll_sleep_s)
         cur_recv = int(arr[self.rank])
         max_recv = int(arr.max())
-        if max_recv > ctx.max_recv_tokens:
-            raise RuntimeError(f"layout receive count {max_recv} exceeds preallocated "
-                               f"symmetric token_src buffer ({ctx.max_recv_tokens}); "
-                               "increase num_worst_tokens or capacity at construction")
-        return cur_recv
+        return cur_recv, max_recv
+
+    def _grow_dispatch_buffers(self, max_recv_tokens: int) -> bool:
+        """Collectively grow receive buffers after layout count publication."""
+        ctx = self.overlap_context
+        max_recv_tokens = int(max_recv_tokens)
+        if (self.num_worst_tokens > 0 or ctx.config.nnodes == 1 or max_recv_tokens <= ctx.max_recv_tokens):
+            return False
+
+        # The layout kernel only publishes counts and sender metadata for the
+        # inter-node data path. Retire it before replacing receive buffers.
+        self.ep_group_barrier()
+        torch.cuda.synchronize()
+        aligned = ((max_recv_tokens + ctx.alloc_alignment - 1) // ctx.alloc_alignment * ctx.alloc_alignment)
+        growth_target = int(aligned * self.capacity_coeff)
+        alloc_tokens = max(max_recv_tokens, growth_target)
+        alloc_tokens = ((alloc_tokens + ctx.alloc_alignment - 1) // ctx.alloc_alignment * ctx.alloc_alignment)
+        old_capacity = ctx.max_recv_tokens
+        if self.rank == 0:
+            print(f"reallocate EP-overlap recv buffers from {old_capacity} to {alloc_tokens}")
+        ctx.reallocate_dispatch_buffers(alloc_tokens)
+        self.ep_group_barrier()
+        torch.cuda.synchronize()
+        return True
+
+    def _prepare_dispatch_layout(
+        self,
+        layout_desc: EPCommLayoutDesc,
+        topk_indices: torch.Tensor,
+        *,
+        comm_num_sm: Optional[int] = None,
+    ) -> Tuple[int, torch.Tensor]:
+        """Compute layout and grow inter-node receive buffers if needed."""
+        self._ensure_dispatch_layout(layout_desc, topk_indices, comm_num_sm=comm_num_sm)
+        buf_count_cpu, kernel_recv_count = self._select_recv_count(layout_desc)
+        cur_recv, max_recv = self._poll_local_recv_count(buf_count_cpu, kernel_recv_count)
+        self._grow_dispatch_buffers(max_recv)
+        return cur_recv, kernel_recv_count
 
     def _prepare_dispatch_buffers(
         self,
@@ -469,12 +542,10 @@ class EPOverlapKernels:
         if topk_weights is not None:
             ctx.ensure_dispatch_input_weight()
 
-        self._ensure_dispatch_layout(layout_desc, topk_indices, comm_num_sm=comm_num_sm)
-
-        buf_count_cpu, kernel_recv_count = self._select_recv_count(layout_desc)
-        dispatch_recv_token_count = self._poll_local_recv_count(
-            buf_count_cpu,
-            kernel_recv_count,
+        dispatch_recv_token_count, kernel_recv_count = self._prepare_dispatch_layout(
+            layout_desc,
+            topk_indices,
+            comm_num_sm=comm_num_sm,
         )
 
         ctx.dispatch_input_buf[:input.shape[0]].copy_(input)
@@ -574,11 +645,10 @@ class EPOverlapKernels:
             )
         self._validate_dispatch_input(input, cfg, op_name="dispatch_cutedsl_inter")
 
-        self._ensure_dispatch_layout(layout_desc, topk_indices, comm_num_sm=comm_num_sm)
-        buf_count_cpu, kernel_recv_count = self._select_recv_count(layout_desc)
-        dispatch_recv_token_count = self._poll_local_recv_count(
-            buf_count_cpu,
-            kernel_recv_count,
+        dispatch_recv_token_count, kernel_recv_count = self._prepare_dispatch_layout(
+            layout_desc,
+            topk_indices,
+            comm_num_sm=comm_num_sm,
         )
 
         ctx = self.overlap_context
@@ -1412,11 +1482,10 @@ class EPOverlapKernels:
                 op_name="dispatch_group_gemm_inter",
             )
 
-        self._ensure_dispatch_layout(layout_desc, topk_indices, comm_num_sm=comm_num_sm)
-        buf_count_cpu, kernel_recv_count = self._select_recv_count(layout_desc)
-        dispatch_recv_token_count = self._poll_local_recv_count(
-            buf_count_cpu,
-            kernel_recv_count,
+        dispatch_recv_token_count, kernel_recv_count = self._prepare_dispatch_layout(
+            layout_desc,
+            topk_indices,
+            comm_num_sm=comm_num_sm,
         )
 
         if ctx.dispatch_output_buf is None or ctx.dispatch_output_ptrs is None:

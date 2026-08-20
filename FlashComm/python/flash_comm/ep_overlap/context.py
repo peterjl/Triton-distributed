@@ -99,8 +99,8 @@ class EPOverlapContext:
         self.full_splits_win_handle: int = 0
         self.token_src_rank_topk_and_indices_buf: torch.Tensor = None
         self.token_src_rank_topk_and_indices_buf_ptrs: torch.Tensor = None
-        # Worst-case recv token count; used as the dummy compile-time M
-        # by ops that ``mark_dynamic`` the M dimension.
+        # Current capacity of dynamically sized receive-data buffers.
+        # Receiver metadata has its own fixed worst-case allocation.
         self.max_recv_tokens: int = 0
 
         # Local eager buffers. In inter-node mode expert_signal_state is
@@ -174,6 +174,7 @@ class EPOverlapContext:
 
         # Strong refs so SymmetricTensor GPU allocations survive GC.
         self._symm_tensors: Dict[str, SymmetricTensor] = {}
+        self._closed = False
 
     @classmethod
     def create(cls, *, max_m: int, hidden: int, topk: int, num_experts: int, group: dist.ProcessGroup,
@@ -241,13 +242,13 @@ class EPOverlapContext:
         )
 
         if self.num_worst_tokens > 0:
-            dispatch_recv_tokens = self.num_worst_tokens
+            self.max_recv_tokens = self.num_worst_tokens
         else:
-            dispatch_recv_tokens = _round_up(
+            self.max_recv_tokens = _round_up(
                 int(cfg.max_m * cfg.topk * self.capacity_coeff),
                 self.alloc_alignment,
             )
-        self._alloc_token_src_meta(dispatch_recv_tokens)
+        self._alloc_token_src_meta(self._max_token_src_meta_tokens())
 
         # Per-expert producer/consumer signals for fused dispatch+gemm.
         # Single (2, experts_per_rank) int32 backing tensor; the two
@@ -281,7 +282,33 @@ class EPOverlapContext:
         self.token_src_rank_topk_and_indices_buf = (token_src_symm.get_local_tensor())
         self.token_src_rank_topk_and_indices_buf_ptrs = token_src_symm.ptrs
         self._symm_tensors["token_src_rank_topk_and_indices"] = token_src_symm
-        self.max_recv_tokens = int(num_alloc_tokens)
+
+    def _max_token_src_meta_tokens(self) -> int:
+        """Return a routing-independent upper bound for receiver metadata."""
+        cfg = self.config
+        max_tokens = cfg.world_size * cfg.max_m * cfg.topk
+        if self.expert_alignment > 1:
+            experts_per_rank = cfg.num_experts // cfg.world_size
+            max_tokens += experts_per_rank * (self.expert_alignment - 1)
+        if self.num_worst_tokens > 0:
+            max_tokens = max(max_tokens, self.num_worst_tokens)
+        return int(max_tokens)
+
+    def _alloc_dispatch_group_gemm_output_weight(self) -> None:
+        if self.dispatch_output_buf is None:
+            raise RuntimeError("dispatch_output_buf must be allocated before "
+                               "dispatch_group_gemm output weights")
+        cfg = self.config
+        symm = SymmetricTensor(
+            shape=(int(self.dispatch_output_buf.shape[0]), ),
+            dtype=cfg.weight_dtype,
+            group=self.group,
+            local_world_size=cfg.local_world_size,
+        )
+        self.dispatch_group_gemm_output_weight_symm_tensor = symm
+        self.dispatch_group_gemm_output_weight_buf = symm.get_local_tensor()
+        self.dispatch_group_gemm_output_weight_ptrs = symm.ptrs
+        self._symm_tensors["dispatch_group_gemm_output_weight"] = symm
 
     def ensure_dispatch_input(self) -> None:
         """Lazy alloc of the symmetric dispatch staging buffer.
@@ -338,20 +365,7 @@ class EPOverlapContext:
         """
         if self.dispatch_group_gemm_output_weight_symm_tensor is not None:
             return
-        if self.dispatch_output_buf is None:
-            raise RuntimeError("dispatch_output_buf must be allocated before "
-                               "dispatch_group_gemm output weights")
-        cfg = self.config
-        symm = SymmetricTensor(
-            shape=(int(self.dispatch_output_buf.shape[0]), ),
-            dtype=cfg.weight_dtype,
-            group=self.group,
-            local_world_size=cfg.local_world_size,
-        )
-        self.dispatch_group_gemm_output_weight_symm_tensor = symm
-        self.dispatch_group_gemm_output_weight_buf = symm.get_local_tensor()
-        self.dispatch_group_gemm_output_weight_ptrs = symm.ptrs
-        self._symm_tensors["dispatch_group_gemm_output_weight"] = symm
+        self._alloc_dispatch_group_gemm_output_weight()
         dist.barrier(group=self.group)
 
     def ensure_combine_output(self) -> None:
@@ -409,6 +423,19 @@ class EPOverlapContext:
         """
         if (self.group_gemm_combine_output_symm_tensor is not None and self.group_gemm_combine_output_n_out == n_out):
             return
+        old_symm = self._symm_tensors.pop("group_gemm_combine_output", None)
+        if old_symm is not None:
+            # Changing N changes the peer-visible allocation. Retire all kernels,
+            # drop every non-owning view, and release the old allocation before
+            # constructing the replacement so N sweeps do not accumulate memory
+            # or temporarily hold both large buffers.
+            torch.cuda.synchronize()
+            dist.barrier(group=self.group)
+            self.group_gemm_combine_output_symm_tensor = None
+            self.group_gemm_combine_output_buf = None
+            self.group_gemm_combine_output_ptrs = None
+            self.group_gemm_combine_output_n_out = None
+            free_symmetric_tensors([old_symm], self.group)
         cfg = self.config
         symm = SymmetricTensor(
             shape=(cfg.max_m * cfg.topk, n_out),
@@ -577,7 +604,7 @@ class EPOverlapContext:
                 int(cfg.max_m * cfg.topk * self.capacity_coeff),
                 self.alloc_alignment,
             )
-        self._alloc_token_src_meta(dispatch_recv_tokens)
+        self._alloc_token_src_meta(self._max_token_src_meta_tokens())
         self._alloc_dispatch_output_buffers(dispatch_recv_tokens)
 
         experts_per_rank = cfg.num_experts // cfg.world_size
@@ -618,6 +645,47 @@ class EPOverlapContext:
         self.dispatch_topk_scatter_indices_ptrs = dispatch_scatter_symm.ptrs
         self._symm_tensors["dispatch_output"] = dispatch_output_symm
         self._symm_tensors["dispatch_topk_scatter_indices"] = dispatch_scatter_symm
+        self.max_recv_tokens = int(dispatch_recv_tokens)
+
+    def reallocate_dispatch_buffers(self, num_alloc_tokens: int) -> bool:
+        """Collectively grow inter-node receive-data symmetric buffers.
+
+        The caller must first retire device work and enter this method on every
+        EP rank. Old allocations are released before replacements are created to
+        avoid a transient peak. Receiver metadata is allocated once at its
+        routing-independent worst case and is intentionally not replaced here.
+        """
+        if self._closed:
+            raise RuntimeError("cannot reallocate a finalized EPOverlapContext")
+        if self.config.nnodes <= 1:
+            return False
+        num_alloc_tokens = int(num_alloc_tokens)
+        if num_alloc_tokens <= self.max_recv_tokens:
+            return False
+
+        had_dispatch_weight = self.dispatch_group_gemm_output_weight_symm_tensor is not None
+        keys = ["dispatch_output", "dispatch_topk_scatter_indices"]
+        if had_dispatch_weight:
+            keys.append("dispatch_group_gemm_output_weight")
+        old_tensors = [self._symm_tensors.pop(key, None) for key in keys]
+
+        # Drop non-owning tensor views before releasing their backing storage.
+        self.dispatch_output_symm_tensor = None
+        self.dispatch_output_buf = None
+        self.dispatch_output_ptrs = None
+        self.dispatch_topk_scatter_indices_symm_tensor = None
+        self.dispatch_topk_scatter_indices_buf = None
+        self.dispatch_topk_scatter_indices_ptrs = None
+        self.dispatch_group_gemm_output_weight_symm_tensor = None
+        self.dispatch_group_gemm_output_weight_buf = None
+        self.dispatch_group_gemm_output_weight_ptrs = None
+
+        free_symmetric_tensors(old_tensors, self.group)
+
+        self._alloc_dispatch_output_buffers(num_alloc_tokens)
+        if had_dispatch_weight:
+            self._alloc_dispatch_group_gemm_output_weight()
+        return True
 
     def rdma_rail_send_slot_views(self, num_token: int, hidden: int, topk: int, max_slot_num_token: int = 0):
         """Views into this rank's NCCL symmetric RDMA rail-send slot."""
@@ -648,22 +716,51 @@ class EPOverlapContext:
             free_symmetric_tensors(nccl_tensors, self.group)
             torch.cuda.synchronize()
             dist.barrier(group=self.group)
-
-        remaining = list(self._symm_tensors.values())
-        self._symm_tensors.clear()
-        if remaining:
-            free_symmetric_tensors(remaining, self.group)
-
-        self.nvl_barrier_buf = None
-        self.nvl_barrier_buf_ptrs = None
         self.rdma_rail_send_buf = None
         self.rdma_rail_send_win_handle = 0
         self.rdma_rail_send_layout = None
         self.full_splits_buf = None
         self.full_splits_buf_ptrs = None
         self.full_splits_win_handle = 0
+
+    def destroy_internode_nccl_gin(self) -> None:
+        """Destroy the context-owned GIN communicator after windows are gone."""
+        if self.config.nnodes <= 1:
+            return
+        if self._owns_nccl_gin and _buffer.nccl_gin_is_initialized():
+            _buffer.nccl_gin_destroy()
+        self._owns_nccl_gin = False
+        self.nccl_gin_dev_comm_buf = None
+        self._dispatch_signal_range = None
+        self._combine_signal_range = None
+
+    def free_buffers(self) -> None:
+        """Collectively release all remaining symmetric and local workspace.
+
+        For internode contexts, :meth:`release_internode_nccl_resources` and
+        :meth:`destroy_internode_nccl_gin` must run first. Idempotent when all
+        ranks call teardown in the same order.
+        """
+        if self._closed:
+            return
+        nccl_keys = {"internode_rdma_rail_send", "internode_full_splits"}
+        live_nccl_keys = nccl_keys.intersection(self._symm_tensors)
+        if live_nccl_keys:
+            raise RuntimeError("release_internode_nccl_resources must run before free_buffers; "
+                               f"live NCCL allocations: {sorted(live_nccl_keys)}")
+
+        tensors = list(self._symm_tensors.values())
+        self._symm_tensors.clear()
+        free_symmetric_tensors(tensors, self.group)
+
+        self.nvl_barrier_buf = None
+        self.nvl_barrier_buf_ptrs = None
+        self.full_splits_buf = None
+        self.full_splits_buf_ptrs = None
+        self.full_splits_win_handle = 0
         self.token_src_rank_topk_and_indices_buf = None
         self.token_src_rank_topk_and_indices_buf_ptrs = None
+        self.max_recv_tokens = 0
         self.dispatch_output_symm_tensor = None
         self.dispatch_output_buf = None
         self.dispatch_output_ptrs = None
@@ -694,14 +791,13 @@ class EPOverlapContext:
         self.expert_signal_state_ptrs = None
         self.expert_signals = None
         self.expert_signal_counters = None
+        self.recv_token_count_cpu = None
+        self.recv_token_count = None
+        self.rdma_rail_send_buf = None
+        self.rdma_rail_send_win_handle = 0
+        self.rdma_rail_send_layout = None
         self.nccl_gin_dev_comm_buf = None
-        if self._owns_nccl_gin and _buffer.nccl_gin_is_initialized():
-            torch.cuda.synchronize()
-            dist.barrier(group=self.group)
-            _buffer.nccl_gin_destroy()
-            torch.cuda.synchronize()
-            dist.barrier(group=self.group)
-        self._owns_nccl_gin = False
+        self._closed = True
 
     def reset_expert_signals(self) -> None:
         """Single-kernel zero of both signal rows (ready flags + CTA counters)."""
