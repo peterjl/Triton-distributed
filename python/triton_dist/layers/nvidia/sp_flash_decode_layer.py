@@ -78,7 +78,9 @@ class SpGQAFlashDecodeAttention(torch.nn.Module):
 
     def finalize(self):
         self.ag_layer.finalize()
-        nvshmem_free_tensor_sync(self.ag_buffer)
+        if self.ag_buffer is not None:
+            nvshmem_free_tensor_sync(self.ag_buffer)
+            self.ag_buffer = None
 
     def forward(self, q, k_cache, v_cache, global_kv_lens, block_table):
         """
