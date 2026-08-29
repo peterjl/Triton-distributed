@@ -38,6 +38,8 @@
   OP(3584, __VA_ARGS__)                                                        \
   OP(3840, __VA_ARGS__)                                                        \
   OP(4096, __VA_ARGS__)                                                        \
+  OP(4352, __VA_ARGS__)                                                        \
+  OP(4864, __VA_ARGS__)                                                        \
   OP(5120, __VA_ARGS__)                                                        \
   OP(6144, __VA_ARGS__)                                                        \
   OP(7168, __VA_ARGS__)                                                        \
