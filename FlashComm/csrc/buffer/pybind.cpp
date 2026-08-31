@@ -85,6 +85,8 @@ void bind_symmetric_memory(py::module &m) {
           static_cast<int>(NCCL_GIN_CONNECTION_FULL),
       py::arg("ep_num_qps") = 1);
   m.def("nccl_gin_destroy", &flash_comm::buffer::nccl_gin_destroy_rank);
+  m.def("nccl_gin_retain", &flash_comm::buffer::nccl_gin_retain_rank);
+  m.def("nccl_gin_release", &flash_comm::buffer::nccl_gin_release_rank);
   m.def("nccl_gin_is_initialized",
         &flash_comm::buffer::nccl_gin_is_initialized);
   m.def("nccl_gin_dev_comm_bytes", []() {
@@ -100,6 +102,7 @@ void bind_symmetric_memory(py::module &m) {
         &flash_comm::buffer::nccl_gin_local_world_size);
   m.def("nccl_gin_lsa_rank", &flash_comm::buffer::nccl_gin_lsa_rank);
   m.def("nccl_gin_lsa_size", &flash_comm::buffer::nccl_gin_lsa_size);
+  m.def("nccl_gin_type", &flash_comm::buffer::nccl_gin_type);
 
   // Helper to create tensor from raw pointer (bypassing strict checks)
   m.def(

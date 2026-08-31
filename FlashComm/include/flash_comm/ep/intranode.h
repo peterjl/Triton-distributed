@@ -58,7 +58,7 @@ void dispatch_intranode_cuda(
     int32_t num_token, int32_t hidden_size, int32_t num_experts_per_rank,
     int32_t rank, int32_t num_ranks, int32_t num_sm, FlashCommDType dtype,
     FlashCommDType weight_dtype, FlashCommDType offset_dtype, int32_t topk,
-    cudaStream_t stream);
+    const int32_t *logical_token_range, cudaStream_t stream);
 
 void dispatch_postprocess_cuda(
     void *recv_x, void *recv_topk_scatter_indices_comm_buffer,
@@ -68,15 +68,14 @@ void dispatch_postprocess_cuda(
     int32_t num_sm, FlashCommDType dtype, FlashCommDType weight_dtype,
     FlashCommDType offset_dtype, cudaStream_t stream);
 
-void combine_intranode_cuda(void *x_ptrs, void *weight_ptrs,
-                            void *topk_send_mask, void *topk_indices,
-                            void *token_dst_scatter_indices, void *recv_x,
-                            void *recv_weight, int32_t num_token,
-                            int32_t hidden_size, int32_t topk,
-                            int32_t num_experts_per_rank, int32_t rank,
-                            int32_t num_ranks, int32_t num_sm,
-                            FlashCommDType dtype, FlashCommDType weight_dtype,
-                            FlashCommDType offset_dtype, cudaStream_t stream);
+void combine_intranode_cuda(
+    void *x_ptrs, void *weight_ptrs, void *topk_send_mask, void *topk_indices,
+    void *token_dst_scatter_indices, void *recv_x, void *recv_weight,
+    bool has_weight, int32_t num_token, int32_t hidden_size, int32_t topk,
+    int32_t num_experts_per_rank, int32_t rank, int32_t num_ranks,
+    int32_t num_sm, FlashCommDType dtype, FlashCommDType weight_dtype,
+    FlashCommDType offset_dtype, const int32_t *logical_token_range,
+    cudaStream_t stream);
 
 void combine_preprocess_inplace_cuda(
     void *x, void *weight_ptrs, int32_t *recv_token_count,
@@ -89,6 +88,10 @@ void combine_preprocess_inplace_cuda(
 void barrier_all_on_stream_cuda(void **barrier_ptrs, int32_t rank,
                                 int32_t num_ranks, FlashCommDType dtype,
                                 cudaStream_t stream);
+void barrier_all_on_stream_range_cuda(void **barrier_ptrs, int32_t rank,
+                                      int32_t num_ranks,
+                                      const int32_t *logical_token_range,
+                                      cudaStream_t stream);
 
 } // namespace intranode
 } // namespace ep

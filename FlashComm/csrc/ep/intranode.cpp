@@ -273,7 +273,7 @@ compute_dispatch_layout(
           recv_aligned_token_count, recv_expert_counts};
 }
 
-void dispatch_intranode(
+static void dispatch_intranode_impl(
     torch::Tensor x,              // [num_token, hidden_size]
     torch::Tensor topk_send_mask, // [num_token, topk]
     c10::optional<torch::Tensor> optional_topk_weights, // [num_token, topk]
@@ -287,31 +287,23 @@ void dispatch_intranode(
                                                   // recv_topk_scatter_indices
                                                   // [num_recv_token, topk]
     int32_t rank, int32_t num_ranks, int32_t num_experts_per_rank,
-    int32_t num_sm) {
+    int32_t num_sm, c10::optional<torch::Tensor> optional_logical_token_range) {
   // check num_ranks <= nvlink domain size
-  int32_t num_token = x.size(0);
-  int32_t hidden_size = x.size(1);
-  int32_t topk = topk_indices.size(1);
+  FLASH_CHECK(x.dim() == 2 && topk_indices.dim() == 2);
+  const int32_t num_token = static_cast<int32_t>(x.size(0));
+  const int32_t hidden_size = static_cast<int32_t>(x.size(1));
+  const int32_t topk = static_cast<int32_t>(topk_indices.size(1));
   if (optional_topk_weights.has_value() &&
       optional_topk_weights.value().defined()) {
-    FLASH_CHECK(x.size(0) == optional_topk_weights.value().size(0))
-        << "dim0 of x and topk_weights must be equal, " << x.size(0)
-        << " != " << optional_topk_weights.value().size(0);
+    check_tensor_shape(optional_topk_weights.value(), "topk_weights",
+                       {num_token, topk});
   }
-  FLASH_CHECK(x.size(0) == topk_indices.size(0))
-      << "dim0 of x and topk_indices must be equal, " << x.size(0)
-      << " != " << topk_indices.size(0);
-  FLASH_CHECK(x.size(0) == token_dst_scatter_indices.size(0))
-      << "dim0 of x and token_dst_scatter_indices must be equal, " << x.size(0)
-      << " != " << token_dst_scatter_indices.size(0);
-  FLASH_CHECK(x.size(0) == topk_send_mask.size(0))
-      << "dim0 of x and topk_send_mask must be equal, " << x.size(0)
-      << " != " << topk_send_mask.size(0);
-  FLASH_CHECK(topk == topk_send_mask.size(1))
-      << "dim1 of topk_send_mask must be equal to topk, " << topk
-      << " != " << topk_send_mask.size(1);
+  FLASH_CHECK(topk_indices.sizes() == token_dst_scatter_indices.sizes());
+  FLASH_CHECK(topk_indices.sizes() == topk_send_mask.sizes());
+  FLASH_CHECK(topk_indices.size(0) == num_token);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  auto dtype = get_flash_comm_dtype(x.scalar_type());
+  const auto dtype = get_flash_comm_dtype(x.scalar_type());
+  const auto offset_dtype = get_flash_comm_dtype(topk_indices.scalar_type());
   auto weight_dtype = FlashCommDType::Float32;
   void *topk_weights_ptr = nullptr;
   if (optional_topk_weights.has_value() &&
@@ -319,10 +311,7 @@ void dispatch_intranode(
     weight_dtype =
         get_flash_comm_dtype(optional_topk_weights.value().scalar_type());
     topk_weights_ptr = optional_topk_weights.value().data_ptr();
-    check_tensor_shape(optional_topk_weights.value(), "topk_weights",
-                       {num_token, topk});
   }
-  auto offset_dtype = get_flash_comm_dtype(topk_indices.scalar_type());
   FLASH_CHECK(dtype == FlashCommDType::BFloat16)
       << "Only BFloat16 token type is currently supported";
   FLASH_CHECK(offset_dtype == FlashCommDType::Int32)
@@ -334,6 +323,15 @@ void dispatch_intranode(
 
   FLASH_CHECK(topk * 2 <= WARP_SIZE);
   FLASH_CHECK(num_ranks * 3 * 8 <= 1024);
+  const int32_t *logical_token_range_ptr = nullptr;
+  if (optional_logical_token_range.has_value() &&
+      optional_logical_token_range.value().defined()) {
+    auto logical_token_range = optional_logical_token_range.value();
+    check_tensor_common(logical_token_range, "logical_token_range", true,
+                        torch::kInt32, 1);
+    check_tensor_shape(logical_token_range, "logical_token_range", {2});
+    logical_token_range_ptr = logical_token_range.data_ptr<int32_t>();
+  }
 
   dispatch_intranode_cuda(
       x.data_ptr(), topk_send_mask.data_ptr(), topk_weights_ptr,
@@ -342,7 +340,38 @@ void dispatch_intranode(
       reinterpret_cast<void **>(recv_weights_ptrs.data_ptr()),
       reinterpret_cast<void **>(recv_topk_scatter_indices_ptrs.data_ptr()),
       num_token, hidden_size, num_experts_per_rank, rank, num_ranks, num_sm,
-      dtype, weight_dtype, offset_dtype, topk, stream);
+      dtype, weight_dtype, offset_dtype, topk, logical_token_range_ptr, stream);
+}
+
+void dispatch_intranode(torch::Tensor x, torch::Tensor topk_send_mask,
+                        c10::optional<torch::Tensor> optional_topk_weights,
+                        torch::Tensor topk_indices,
+                        torch::Tensor token_dst_scatter_indices,
+                        torch::Tensor recv_x_ptrs,
+                        torch::Tensor recv_weights_ptrs,
+                        torch::Tensor recv_topk_scatter_indices_ptrs,
+                        int32_t rank, int32_t num_ranks,
+                        int32_t num_experts_per_rank, int32_t num_sm) {
+  dispatch_intranode_impl(x, topk_send_mask, optional_topk_weights,
+                          topk_indices, token_dst_scatter_indices, recv_x_ptrs,
+                          recv_weights_ptrs, recv_topk_scatter_indices_ptrs,
+                          rank, num_ranks, num_experts_per_rank, num_sm,
+                          c10::nullopt);
+}
+
+void dispatch_intranode_range(
+    torch::Tensor x, torch::Tensor topk_send_mask,
+    c10::optional<torch::Tensor> optional_topk_weights,
+    torch::Tensor topk_indices, torch::Tensor token_dst_scatter_indices,
+    torch::Tensor logical_token_range, torch::Tensor recv_x_ptrs,
+    torch::Tensor recv_weights_ptrs,
+    torch::Tensor recv_topk_scatter_indices_ptrs, int32_t rank,
+    int32_t num_ranks, int32_t num_experts_per_rank, int32_t num_sm) {
+  dispatch_intranode_impl(x, topk_send_mask, optional_topk_weights,
+                          topk_indices, token_dst_scatter_indices, recv_x_ptrs,
+                          recv_weights_ptrs, recv_topk_scatter_indices_ptrs,
+                          rank, num_ranks, num_experts_per_rank, num_sm,
+                          logical_token_range);
 }
 
 // dispatch_postprocess host function:
@@ -443,7 +472,7 @@ void dispatch_postprocess(
       weight_dtype, offset_dtype, stream);
 }
 
-void combine_intranode(
+static void combine_intranode_impl(
     torch::Tensor x_ptrs,         // [num_ranks], shape of x is [num_recv_token,
                                   // hidden_size], need in symmetric memory
     torch::Tensor topk_send_mask, // [num_recv_token, topk]
@@ -452,11 +481,12 @@ void combine_intranode(
     torch::Tensor recv_x,                    // [num_token, hidden_size]
     int32_t rank, int32_t num_ranks, int32_t num_experts_per_rank,
     int32_t num_sm, c10::optional<torch::Tensor> optional_weight_ptrs,
-    c10::optional<torch::Tensor> optional_recv_weight) {
+    c10::optional<torch::Tensor> optional_recv_weight,
+    c10::optional<torch::Tensor> optional_logical_token_range) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  auto dtype = get_flash_comm_dtype(recv_x.scalar_type());
-  auto offset_dtype = get_flash_comm_dtype(topk_indices.scalar_type());
-  int token_size = recv_x.element_size();
+  const auto dtype = get_flash_comm_dtype(recv_x.scalar_type());
+  const auto offset_dtype = get_flash_comm_dtype(topk_indices.scalar_type());
+  const int token_size = recv_x.element_size();
 
   FLASH_CHECK(x_ptrs.size(0) == num_ranks)
       << "dim0 of x_ptrs must be equal to num_ranks, " << x_ptrs.size(0)
@@ -467,9 +497,11 @@ void combine_intranode(
   FLASH_CHECK(topk_indices.size(1) == token_dst_scatter_indices.size(1))
       << "dim1 of topk_indices and token_dst_scatter_indices must be equal, "
       << topk_indices.size(1) << " != " << token_dst_scatter_indices.size(1);
-  int32_t num_token = topk_indices.size(0);
-  int32_t hidden_size = recv_x.size(1);
-  int32_t topk = topk_indices.size(1);
+  const int32_t num_token = topk_indices.size(0);
+  const int32_t hidden_size = recv_x.size(1);
+  const int32_t topk = topk_indices.size(1);
+  FLASH_CHECK(topk_send_mask.sizes() == topk_indices.sizes());
+  FLASH_CHECK(token_dst_scatter_indices.sizes() == topk_indices.sizes());
 
   FLASH_CHECK(hidden_size % (128 / token_size) == 0)
       << "hidden_size must be divisible by 128 / token_size, " << hidden_size
@@ -477,21 +509,26 @@ void combine_intranode(
 
   void *weight_ptrs = nullptr;
   void *recv_weight = nullptr;
+  bool has_weight_ptrs = false;
+  bool has_recv_weight = false;
   auto weight_dtype = FlashCommDType::Float32;
   if (optional_weight_ptrs.has_value() and
       optional_weight_ptrs.value().defined()) {
     weight_ptrs = optional_weight_ptrs.value().data_ptr();
+    has_weight_ptrs = true;
     check_tensor_shape(optional_weight_ptrs.value(), "weight_ptrs",
                        {num_ranks});
   }
   if (optional_recv_weight.has_value() and
       optional_recv_weight.value().defined()) {
     recv_weight = optional_recv_weight.value().data_ptr();
+    has_recv_weight = true;
     weight_dtype =
         get_flash_comm_dtype(optional_recv_weight.value().scalar_type());
     check_tensor_shape(optional_recv_weight.value(), "recv_weight",
                        {num_token, topk});
   }
+  FLASH_CHECK(has_weight_ptrs == has_recv_weight);
 
   FLASH_CHECK(dtype == FlashCommDType::BFloat16)
       << "Only BFloat16 token type is currently supported";
@@ -499,13 +536,48 @@ void combine_intranode(
       << "Only Int32 offset type is currently supported";
   FLASH_CHECK(weight_dtype == FlashCommDType::Float32)
       << "Only Float32 weight type is currently supported";
+  const int32_t *logical_token_range_ptr = nullptr;
+  if (optional_logical_token_range.has_value() &&
+      optional_logical_token_range.value().defined()) {
+    auto logical_token_range = optional_logical_token_range.value();
+    check_tensor_common(logical_token_range, "logical_token_range", true,
+                        torch::kInt32, 1);
+    check_tensor_shape(logical_token_range, "logical_token_range", {2});
+    logical_token_range_ptr = logical_token_range.data_ptr<int32_t>();
+  }
 
-  combine_intranode_cuda(x_ptrs.data_ptr(), weight_ptrs,
-                         topk_send_mask.data_ptr(), topk_indices.data_ptr(),
-                         token_dst_scatter_indices.data_ptr(),
-                         recv_x.data_ptr(), recv_weight, num_token, hidden_size,
-                         topk, num_experts_per_rank, rank, num_ranks, num_sm,
-                         dtype, weight_dtype, offset_dtype, stream);
+  combine_intranode_cuda(
+      x_ptrs.data_ptr(), weight_ptrs, topk_send_mask.data_ptr(),
+      topk_indices.data_ptr(), token_dst_scatter_indices.data_ptr(),
+      recv_x.data_ptr(), recv_weight, has_recv_weight, num_token, hidden_size,
+      topk, num_experts_per_rank, rank, num_ranks, num_sm, dtype, weight_dtype,
+      offset_dtype, logical_token_range_ptr, stream);
+}
+
+void combine_intranode(torch::Tensor x_ptrs, torch::Tensor topk_send_mask,
+                       torch::Tensor topk_indices,
+                       torch::Tensor token_dst_scatter_indices,
+                       torch::Tensor recv_x, int32_t rank, int32_t num_ranks,
+                       int32_t num_experts_per_rank, int32_t num_sm,
+                       c10::optional<torch::Tensor> optional_weight_ptrs,
+                       c10::optional<torch::Tensor> optional_recv_weight) {
+  combine_intranode_impl(x_ptrs, topk_send_mask, topk_indices,
+                         token_dst_scatter_indices, recv_x, rank, num_ranks,
+                         num_experts_per_rank, num_sm, optional_weight_ptrs,
+                         optional_recv_weight, c10::nullopt);
+}
+
+void combine_intranode_range(
+    torch::Tensor x_ptrs, torch::Tensor topk_send_mask,
+    torch::Tensor topk_indices, torch::Tensor token_dst_scatter_indices,
+    torch::Tensor logical_token_range, torch::Tensor recv_x, int32_t rank,
+    int32_t num_ranks, int32_t num_experts_per_rank, int32_t num_sm,
+    c10::optional<torch::Tensor> optional_weight_ptrs,
+    c10::optional<torch::Tensor> optional_recv_weight) {
+  combine_intranode_impl(x_ptrs, topk_send_mask, topk_indices,
+                         token_dst_scatter_indices, recv_x, rank, num_ranks,
+                         num_experts_per_rank, num_sm, optional_weight_ptrs,
+                         optional_recv_weight, logical_token_range);
 }
 
 void combine_preprocess_inplace(
@@ -590,6 +662,19 @@ void barrier_all_on_stream(torch::Tensor barrier_ptrs, int32_t rank,
                              rank, num_ranks, FlashCommDType::Int32, stream);
 }
 
+void barrier_all_on_stream_range(torch::Tensor barrier_ptrs, int32_t rank,
+                                 int32_t num_ranks,
+                                 torch::Tensor logical_token_range) {
+  check_ptrs_tensor_i64(barrier_ptrs, num_ranks, "barrier_ptrs");
+  check_tensor_common(logical_token_range, "logical_token_range", true,
+                      torch::kInt32, 1);
+  check_tensor_shape(logical_token_range, "logical_token_range", {2});
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  barrier_all_on_stream_range_cuda(
+      reinterpret_cast<void **>(barrier_ptrs.data_ptr()), rank, num_ranks,
+      logical_token_range.data_ptr<int32_t>(), stream);
+}
+
 } // namespace intranode
 } // namespace ep
 } // namespace flash_comm
@@ -659,6 +744,15 @@ void bind_intranode_ops(py::module &m) {
         py::arg("recv_weights_ptrs"), py::arg("recv_topk_scatter_indices_ptrs"),
         py::arg("rank"), py::arg("num_ranks"), py::arg("num_experts_per_rank"),
         py::arg("num_sm"), "intranode dispatch for ep");
+  m.def("dispatch_intranode_range",
+        &flash_comm::ep::intranode::dispatch_intranode_range, py::arg("x"),
+        py::arg("topk_send_mask"), py::arg("optional_topk_weights"),
+        py::arg("topk_indices"), py::arg("token_dst_scatter_indices"),
+        py::arg("logical_token_range"), py::arg("recv_x_ptrs"),
+        py::arg("recv_weights_ptrs"), py::arg("recv_topk_scatter_indices_ptrs"),
+        py::arg("rank"), py::arg("num_ranks"), py::arg("num_experts_per_rank"),
+        py::arg("num_sm"),
+        "Intranode dispatch for one device-selected token range.");
   m.def("dispatch_postprocess",
         &flash_comm::ep::intranode::dispatch_postprocess, py::arg("recv_x"),
         py::arg("recv_topk_scatter_indices_comm_buffer"),
@@ -685,7 +779,21 @@ void bind_intranode_ops(py::module &m) {
         "of shape [num_ranks].\n"
         "If recv_weight is provided, it must be a contiguous CUDA float32 "
         "tensor of shape [num_token, topk]");
+  m.def("combine_intranode_range",
+        &flash_comm::ep::intranode::combine_intranode_range, py::arg("x_ptrs"),
+        py::arg("topk_send_mask"), py::arg("topk_indices"),
+        py::arg("token_dst_scatter_indices"), py::arg("logical_token_range"),
+        py::arg("recv_x"), py::arg("rank"), py::arg("num_ranks"),
+        py::arg("num_experts_per_rank"), py::arg("num_sm"),
+        py::arg("weight_ptrs") = py::none(),
+        py::arg("recv_weight") = py::none(),
+        "Intranode combine for one device-selected token range.");
   m.def("barrier_all_on_stream",
         &flash_comm::ep::intranode::barrier_all_on_stream,
         "intranode barrier all on stream");
+  m.def("barrier_all_on_stream_range",
+        &flash_comm::ep::intranode::barrier_all_on_stream_range,
+        py::arg("barrier_ptrs"), py::arg("rank"), py::arg("num_ranks"),
+        py::arg("logical_token_range"),
+        "Intranode stream barrier gated by a common device token range.");
 }

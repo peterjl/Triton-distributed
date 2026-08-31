@@ -25,6 +25,7 @@
 
 // Forward declarations
 void bind_intranode_ops(py::module &m);
+void bind_ep_chunk_plan_ops(py::module &m);
 void bind_symmetric_memory(py::module &m);
 
 namespace flash_comm {
@@ -43,6 +44,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   auto ep_internode =
       m.def_submodule("ep_internode", "Expert Parallel internode (NCCL GIN)");
   flash_comm::ep::internode::bind_internode_ops(ep_internode);
+
+  auto ep_chunk_plan =
+      m.def_submodule("ep_chunk_plan", "Expert Parallel chunk planning");
+  bind_ep_chunk_plan_ops(ep_chunk_plan);
 
   auto buffer = m.def_submodule("buffer", "Buffer operations");
   bind_symmetric_memory(buffer);

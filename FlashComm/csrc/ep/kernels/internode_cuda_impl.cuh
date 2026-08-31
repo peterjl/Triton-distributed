@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "ep_world_barrier.cuh"
 #include "flash_comm/common.h"
 #include "flash_comm/copy.cuh"
 #include "flash_comm/ep/internode.h"
@@ -39,13 +40,14 @@ namespace internode {
 namespace kernels {
 
 constexpr int WARP_SIZE = 32;
-// Layout and barriers remain on context 0. Internode payload transfers use
-// contexts [0, num_qps) at runtime so one logical transfer can stripe over
-// multiple GIN QPs while preserving the single-QP default path.
+// Payload transfers use contexts [0, num_qps). Layout publication and world
+// barriers share context 0 and barrier slot 0; their ordering requirements are
+// expressed by the barrier memory order below.
 constexpr int kGinLayoutPutCtx = 0;
 constexpr int kGinDispatchPutCtx = 0;
 constexpr int kGinCombinePutCtx = 0;
 constexpr int kGinBarrierCtx = 0;
+constexpr int kGinBarrierId = 0;
 
 // GIN signal ids are partitioned by protocol, node and dispatch chunk
 // (kMaxDispatchPipelineChunks and the id-space layout live in
@@ -114,23 +116,6 @@ __device__ __forceinline__ void gin_put_region_tail_signal(
   }
 }
 
-__device__ __forceinline__ void
-gin_world_barrier_after_puts(ncclDevComm dev_comm) {
-  if (blockIdx.x != 0) {
-    return;
-  }
-  ncclGin gin{dev_comm, kGinBarrierCtx};
-  if (threadIdx.x == 0) {
-    ncclGin gin_put{dev_comm, kGinLayoutPutCtx};
-    gin_put.flush(ncclCoopThread(), cuda::memory_order_release);
-  }
-  __syncthreads();
-  ncclBarrierSession<ncclCoopCta> bar{ncclCoopCta(), ncclTeamTagWorld(), gin,
-                                      0};
-  bar.sync(ncclCoopCta(), cuda::memory_order_acquire,
-           ncclGinFenceLevel::Relaxed);
-}
-
 __device__ __forceinline__ void gin_world_barrier_release(ncclDevComm dev_comm,
                                                           int32_t num_qps) {
   if (blockIdx.x != 0) {
@@ -144,7 +129,7 @@ __device__ __forceinline__ void gin_world_barrier_release(ncclDevComm dev_comm,
   }
   __syncthreads();
   ncclBarrierSession<ncclCoopCta> bar{ncclCoopCta(), ncclTeamTagWorld(), gin,
-                                      0};
+                                      kGinBarrierId};
   bar.sync(ncclCoopCta(), cuda::memory_order_release,
            ncclGinFenceLevel::Relaxed);
 }
@@ -191,6 +176,8 @@ __device__ __forceinline__ T block_scan_inclusive(T value, T *warp_sums) {
 
 #if !defined(FLASH_COMM_INTERNODE_INSTANTIATION)
 
+// Standard EP layout kernel kept unchanged. Range EP uses the independent
+// kernel below so the default path and its launch behavior remain stable.
 template <int32_t kNumWarps>
 void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
     kernel_compute_dispatch_layout(
@@ -277,7 +264,8 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
   // Block 0 flushes the shared put context and performs the world barrier
   // after every CTA has finished issuing puts.
   if (block_id == 0) {
-    gin_world_barrier_after_puts(dev_comm);
+    ::flash_comm::ep::kernels::ep_world_barrier_after_puts(
+        dev_comm, kGinBarrierCtx, kGinLayoutPutCtx, true);
   }
   cooperative_groups::this_grid().sync();
 
@@ -419,6 +407,70 @@ void __global__ __launch_bounds__(512, 1)
   gin_world_barrier_release(dev_comm, max_qps);
 }
 
+void __global__ kernel_stage_dispatch_range(
+    ncclWindow_t rdma_win, size_t source_slot_offset, size_t token_region_bytes,
+    size_t weight_region_offset, const uint4 *x, const int32_t *topk_indices,
+    const int32_t *topk_send_mask, const int32_t *token_dst_scatter_indices,
+    const float *topk_weights, int32_t num_token, int32_t hidden_size,
+    int32_t topk, const int32_t *logical_token_range) {
+  const int32_t logical_begin = logical_token_range[0];
+  const int32_t logical_end = logical_token_range[1];
+  if (logical_end <= logical_begin) {
+    return;
+  }
+  const int32_t begin = max(0, min(logical_begin, num_token));
+  const int32_t end = max(0, min(logical_end, num_token));
+  if (end <= begin) {
+    return;
+  }
+  const int32_t active = end - begin;
+  char *slot = reinterpret_cast<char *>(
+      ncclGetLocalPointer(rdma_win, source_slot_offset));
+
+  const int64_t row_bytes =
+      static_cast<int64_t>(hidden_size) * sizeof(uint16_t);
+  const int64_t x_vecs_per_row = row_bytes / sizeof(uint4);
+  const int64_t x_vec_count = static_cast<int64_t>(active) * x_vecs_per_row;
+  uint4 *dst_x = reinterpret_cast<uint4 *>(slot);
+  const uint4 *src_x = x + static_cast<int64_t>(begin) * x_vecs_per_row;
+  for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < x_vec_count;
+       i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    __stcg(dst_x + i, __ldcg(src_x + i));
+  }
+
+  const int64_t meta_count = static_cast<int64_t>(active) * topk;
+  const int64_t src_meta_begin = static_cast<int64_t>(begin) * topk;
+  int32_t *dst_topk = reinterpret_cast<int32_t *>(slot + token_region_bytes);
+  int32_t *dst_mask = dst_topk + meta_count;
+  int32_t *dst_scatter = dst_mask + meta_count;
+  float *dst_weights = reinterpret_cast<float *>(slot + weight_region_offset);
+  for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < meta_count;
+       i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t src_i = src_meta_begin + i;
+    // Routing/weights are full-input; mask/scatter are step-local compact.
+    dst_topk[i] = topk_indices[src_i];
+    dst_mask[i] = topk_send_mask[i];
+    dst_scatter[i] = token_dst_scatter_indices[i];
+    if (topk_weights != nullptr) {
+      dst_weights[i] = topk_weights[src_i];
+    }
+  }
+}
+
+void __global__ __launch_bounds__(512, 1)
+    kernel_internode_gin_barrier_if_active(ncclDevComm dev_comm,
+                                           int32_t max_qps,
+                                           const int32_t *logical_token_range) {
+  if (logical_token_range[1] <= logical_token_range[0]) {
+    return;
+  }
+  if (threadIdx.x == 0) {
+    __threadfence_system();
+  }
+  __syncthreads();
+  gin_world_barrier_release(dev_comm, max_qps);
+}
+
 // Fused reset-signals-then-barrier. Signal ids are context-local, so the
 // range [signal_begin, signal_end) is reset on every context in [0, max_qps).
 // The order is load-bearing: the reset must complete before this rank arrives
@@ -439,8 +491,8 @@ void __global__ __launch_bounds__(512, 1)
   const int32_t total = range * max_qps;
   for (int32_t i = static_cast<int32_t>(threadIdx.x); i < total;
        i += static_cast<int32_t>(blockDim.x)) {
-    // kGinDispatchPutCtx == kGinCombinePutCtx == 0: contexts [0, max_qps)
-    // cover both protocols' payload contexts.
+    // Dispatch and combine share contexts [0, max_qps); signal-id ranges keep
+    // their protocol state disjoint.
     const int32_t ctx = i / range;
     const ncclGinSignal_t sig =
         static_cast<ncclGinSignal_t>(signal_begin + i % range);
@@ -450,6 +502,31 @@ void __global__ __launch_bounds__(512, 1)
   // Publish every thread's resets (and any stream-ordered D2D writes into the
   // RDMA window) at system scope before arriving at the barrier: sync first so
   // thread 0's fence covers all reset stores.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence_system();
+  }
+  __syncthreads();
+  gin_world_barrier_release(dev_comm, max_qps);
+}
+
+void __global__ __launch_bounds__(512, 1)
+    kernel_internode_gin_reset_signals_barrier_if_active(
+        ncclDevComm dev_comm, int32_t max_qps, int32_t signal_begin,
+        int32_t signal_end, const int32_t *logical_token_range) {
+  if (logical_token_range[1] <= logical_token_range[0]) {
+    return;
+  }
+  const int32_t range = signal_end - signal_begin;
+  const int32_t total = range * max_qps;
+  for (int32_t i = static_cast<int32_t>(threadIdx.x); i < total;
+       i += static_cast<int32_t>(blockDim.x)) {
+    const int32_t ctx = i / range;
+    const ncclGinSignal_t sig =
+        static_cast<ncclGinSignal_t>(signal_begin + i % range);
+    ncclGin sig_gin{dev_comm, ctx};
+    sig_gin.resetSignal(sig);
+  }
   __syncthreads();
   if (threadIdx.x == 0) {
     __threadfence_system();
@@ -474,6 +551,22 @@ void internode_barrier_on_stream_cuda(const void *dev_comm_host,
   CUDA_CHECK(cudaGetLastError());
 }
 
+void internode_barrier_on_stream_if_active_cuda(
+    const void *dev_comm_host, int32_t max_qps,
+    const int32_t *logical_token_range, cudaStream_t stream) {
+  FLASH_CHECK(max_qps > 0);
+  FLASH_CHECK(logical_token_range != nullptr);
+  ncclDevComm dev_comm = *static_cast<const ncclDevComm *>(dev_comm_host);
+  dim3 block_dim(512);
+  dim3 grid_dim(1);
+  void *kernel_args[] = {&dev_comm, &max_qps, &logical_token_range};
+  flash_comm::launch_kernel_ex(
+      (void *)kernels::kernel_internode_gin_barrier_if_active, grid_dim,
+      block_dim, kernel_args, 0, stream,
+      flash_comm::internal::get_cga_cluster_size(), false);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 void internode_reset_signals_barrier_on_stream_cuda(const void *dev_comm_host,
                                                     int32_t max_qps,
                                                     int32_t signal_begin,
@@ -491,6 +584,62 @@ void internode_reset_signals_barrier_on_stream_cuda(const void *dev_comm_host,
       (void *)kernels::kernel_internode_gin_reset_signals_barrier, grid_dim,
       block_dim, kernel_args, 0, stream,
       flash_comm::internal::get_cga_cluster_size(), false);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void internode_reset_signals_barrier_on_stream_if_active_cuda(
+    const void *dev_comm_host, int32_t max_qps, int32_t signal_begin,
+    int32_t signal_end, const int32_t *logical_token_range,
+    cudaStream_t stream) {
+  FLASH_CHECK(max_qps > 0);
+  FLASH_CHECK(signal_begin >= 0 && signal_begin <= signal_end);
+  FLASH_CHECK(logical_token_range != nullptr);
+  ncclDevComm dev_comm = *static_cast<const ncclDevComm *>(dev_comm_host);
+  dim3 block_dim(512);
+  dim3 grid_dim(1);
+  void *kernel_args[] = {&dev_comm, &max_qps, &signal_begin, &signal_end,
+                         &logical_token_range};
+  flash_comm::launch_kernel_ex(
+      (void *)kernels::kernel_internode_gin_reset_signals_barrier_if_active,
+      grid_dim, block_dim, kernel_args, 0, stream,
+      flash_comm::internal::get_cga_cluster_size(), false);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void stage_dispatch_internode_range_cuda(
+    uintptr_t rdma_rail_send_win_handle, const void *x,
+    const int32_t *topk_indices, const int32_t *topk_send_mask,
+    const int32_t *token_dst_scatter_indices, const void *topk_weights,
+    int32_t num_token, int32_t max_slot_num_token, int32_t hidden_size,
+    int32_t topk, int32_t rank, int32_t local_world_size,
+    const int32_t *logical_token_range, cudaStream_t stream) {
+  FLASH_CHECK(hidden_size > 0 && topk > 0);
+  FLASH_CHECK(logical_token_range != nullptr);
+  FLASH_CHECK((static_cast<int64_t>(hidden_size) * sizeof(uint16_t)) %
+                  sizeof(uint4) ==
+              0);
+  const int32_t nnodes = 1;
+  const auto layout =
+      rdma_rail_send_layout_desc(max_slot_num_token, hidden_size, topk, nnodes);
+  const int32_t node = rank / local_world_size;
+  const size_t source_slot_offset =
+      static_cast<size_t>(node) * layout.slot_stride_bytes;
+  ncclWindow_t rdma_win =
+      reinterpret_cast<ncclWindow_t>(rdma_rail_send_win_handle);
+  const float *weights = static_cast<const float *>(topk_weights);
+  constexpr int32_t threads = 256;
+  const int64_t max_x_vecs = static_cast<int64_t>(max_slot_num_token) *
+                             hidden_size * sizeof(uint16_t) / sizeof(uint4);
+  const int64_t max_meta = static_cast<int64_t>(max_slot_num_token) * topk;
+  const int64_t max_work = max_x_vecs > max_meta ? max_x_vecs : max_meta;
+  const int64_t requested_blocks = (max_work + threads - 1) / threads;
+  const int32_t blocks =
+      static_cast<int32_t>(requested_blocks < 2048 ? requested_blocks : 2048);
+  kernels::kernel_stage_dispatch_range<<<blocks, threads, 0, stream>>>(
+      rdma_win, source_slot_offset, layout.token_region_bytes,
+      layout.topk_weights_offset, static_cast<const uint4 *>(x), topk_indices,
+      topk_send_mask, token_dst_scatter_indices, weights, num_token,
+      hidden_size, topk, logical_token_range);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -566,7 +715,8 @@ void dispatch_internode_cuda(
     int32_t local_world_size, int32_t max_recv_tokens, int32_t num_sm,
     const void *dev_comm_host, int32_t num_qps, FlashCommDType dtype,
     FlashCommDType weight_dtype, FlashCommDType offset_dtype, int32_t topk,
-    int32_t dispatch_pipeline_chunks, cudaStream_t stream) {
+    int32_t dispatch_pipeline_chunks, const int32_t *logical_token_range,
+    cudaStream_t stream) {
   FLASH_CHECK(num_ranks % local_world_size == 0);
   FLASH_CHECK(num_qps > 0);
   FLASH_CHECK(num_sm > 0);
@@ -598,6 +748,7 @@ void dispatch_internode_cuda(
                                            offset_dtype,
                                            topk,
                                            dispatch_pipeline_chunks,
+                                           logical_token_range,
                                            stream};
   switch (hidden_size) {
     SUPPORTED_HIDDEN_SIZES(FLASH_COMM_DISPATCH_HIDDEN_CASE, args)
@@ -617,7 +768,8 @@ void combine_internode_cuda(
     int32_t rank, int32_t num_ranks, int32_t local_world_size, int32_t num_sm,
     const void *dev_comm_host, int32_t num_qps, FlashCommDType dtype,
     FlashCommDType weight_dtype, FlashCommDType offset_dtype,
-    int32_t combine_pipeline_chunks, cudaStream_t stream) {
+    int32_t combine_pipeline_chunks, const int32_t *logical_token_range,
+    cudaStream_t stream) {
   FLASH_CHECK(num_ranks % local_world_size == 0);
   FLASH_CHECK(num_qps > 0);
   FLASH_CHECK(num_sm > 0);
@@ -650,6 +802,7 @@ void combine_internode_cuda(
                                           weight_dtype,
                                           offset_dtype,
                                           combine_pipeline_chunks,
+                                          logical_token_range,
                                           stream};
   switch (hidden_size) {
     SUPPORTED_HIDDEN_SIZES(FLASH_COMM_COMBINE_HIDDEN_CASE, args)
@@ -1054,7 +1207,7 @@ struct MaxCombineLoadStages {
 
 template <typename token_t, typename weight_t, typename offset_t,
           int32_t kHiddenSize, int32_t kTopk, int32_t kNumStages,
-          int32_t kNumConsumerGroups, bool kHasWeight>
+          int32_t kNumConsumerGroups, bool kHasWeight, bool kRanged>
 void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
     kernel_dispatch_internode(
         ncclDevComm dev_comm, RDMARailWindowDesc rdma_desc,
@@ -1064,7 +1217,12 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
         int32_t local_world_size, int32_t max_recv_tokens, int32_t num_qps,
         void *recv_x_ptrs, void **recv_weights_ptrs,
         offset_t **recv_topk_scatter_indices_ptrs,
-        int32_t dispatch_pipeline_chunks) {
+        int32_t dispatch_pipeline_chunks, const int32_t *logical_token_range) {
+  if constexpr (kRanged) {
+    if (logical_token_range[1] <= logical_token_range[0]) {
+      return;
+    }
+  }
   extern __shared__ __align__(1024) uint8_t smem_buffer[];
   using smem_t = smem::DispatchIntraNodeSmem<token_t, weight_t, offset_t,
                                              kHiddenSize, kNumStages>;
@@ -1418,6 +1576,7 @@ void detail::dispatch_internode_cuda_hidden(
   auto offset_dtype = args.offset_dtype;
   auto topk = args.topk;
   auto dispatch_pipeline_chunks = args.dispatch_pipeline_chunks;
+  auto logical_token_range = args.logical_token_range;
   auto stream = args.stream;
   const int32_t nnodes = num_ranks / local_world_size;
 
@@ -1460,48 +1619,53 @@ void detail::dispatch_internode_cuda_hidden(
                                                    kHiddenSize, kNumStages>;
           constexpr int32_t smem_size = sizeof(smem_t);
 
+          const bool ranged = logical_token_range != nullptr;
           DISPATCH_BOOL(has_weight, kHasWeight, {
-            auto kernel_fn = kernels::kernel_dispatch_internode<
-                token_t, weight_t, offset_t, kHiddenSize, kTopk, kNumStages,
-                kNumConsumerGroups, kHasWeight>;
-            CUDA_CHECK(cudaFuncSetAttribute(
-                kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                smem_size));
-            kernels::RDMARailWindowDesc rdma_desc_arg = rdma_desc;
-            offset_t *node_topk_indices_arg =
-                reinterpret_cast<offset_t *>(node_topk_indices);
-            int32_t *node_topk_send_mask_arg = node_topk_send_mask;
-            offset_t *node_token_dst_scatter_indices_arg =
-                reinterpret_cast<offset_t *>(node_token_dst_scatter_indices);
-            int32_t num_experts_per_rank_arg = num_experts_per_rank;
-            int32_t rank_arg = rank;
-            int32_t num_ranks_arg = num_ranks;
-            int32_t local_world_size_arg = local_world_size;
-            int32_t max_recv_tokens_arg = max_recv_tokens;
-            int32_t num_qps_arg = num_qps;
-            int32_t dispatch_pipeline_chunks_arg = dispatch_pipeline_chunks;
-            offset_t **recv_topk_ptrs_arg =
-                reinterpret_cast<offset_t **>(recv_topk_scatter_indices_ptrs);
-            void *kernel_args[] = {&dev_comm,
-                                   &rdma_desc_arg,
-                                   &num_tokens_per_rank,
-                                   &node_topk_indices_arg,
-                                   &node_topk_send_mask_arg,
-                                   &node_token_dst_scatter_indices_arg,
-                                   &num_experts_per_rank_arg,
-                                   &rank_arg,
-                                   &num_ranks_arg,
-                                   &local_world_size_arg,
-                                   &max_recv_tokens_arg,
-                                   &num_qps_arg,
-                                   &recv_x_ptrs,
-                                   &recv_weights_ptrs,
-                                   &recv_topk_ptrs_arg,
-                                   &dispatch_pipeline_chunks_arg};
-            flash_comm::launch_kernel_ex(
-                reinterpret_cast<const void *>(kernel_fn), grid_dim, block_dim,
-                kernel_args, smem_size, stream,
-                flash_comm::internal::get_cga_cluster_size(), false);
+            DISPATCH_BOOL(ranged, kRanged, {
+              auto kernel_fn = kernels::kernel_dispatch_internode<
+                  token_t, weight_t, offset_t, kHiddenSize, kTopk, kNumStages,
+                  kNumConsumerGroups, kHasWeight, kRanged>;
+              CUDA_CHECK(cudaFuncSetAttribute(
+                  kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                  smem_size));
+              kernels::RDMARailWindowDesc rdma_desc_arg = rdma_desc;
+              offset_t *node_topk_indices_arg =
+                  reinterpret_cast<offset_t *>(node_topk_indices);
+              int32_t *node_topk_send_mask_arg = node_topk_send_mask;
+              offset_t *node_token_dst_scatter_indices_arg =
+                  reinterpret_cast<offset_t *>(node_token_dst_scatter_indices);
+              int32_t num_experts_per_rank_arg = num_experts_per_rank;
+              int32_t rank_arg = rank;
+              int32_t num_ranks_arg = num_ranks;
+              int32_t local_world_size_arg = local_world_size;
+              int32_t max_recv_tokens_arg = max_recv_tokens;
+              int32_t num_qps_arg = num_qps;
+              int32_t dispatch_pipeline_chunks_arg = dispatch_pipeline_chunks;
+              const int32_t *logical_token_range_arg = logical_token_range;
+              offset_t **recv_topk_ptrs_arg =
+                  reinterpret_cast<offset_t **>(recv_topk_scatter_indices_ptrs);
+              void *kernel_args[] = {&dev_comm,
+                                     &rdma_desc_arg,
+                                     &num_tokens_per_rank,
+                                     &node_topk_indices_arg,
+                                     &node_topk_send_mask_arg,
+                                     &node_token_dst_scatter_indices_arg,
+                                     &num_experts_per_rank_arg,
+                                     &rank_arg,
+                                     &num_ranks_arg,
+                                     &local_world_size_arg,
+                                     &max_recv_tokens_arg,
+                                     &num_qps_arg,
+                                     &recv_x_ptrs,
+                                     &recv_weights_ptrs,
+                                     &recv_topk_ptrs_arg,
+                                     &dispatch_pipeline_chunks_arg,
+                                     &logical_token_range_arg};
+              flash_comm::launch_kernel_ex(
+                  reinterpret_cast<const void *>(kernel_fn), grid_dim,
+                  block_dim, kernel_args, smem_size, stream,
+                  flash_comm::internal::get_cga_cluster_size(), false);
+            });
           });
         });
       });
@@ -1515,7 +1679,7 @@ namespace kernels {
 template <typename token_t, typename weight_t, typename offset_t, int32_t kTopk,
           int32_t kHiddenSize, int32_t kNumLoadStages, int32_t kNumStoreStages,
           int32_t kNumWarps, int32_t kWarpsPerWG, int32_t kElemsPerThread,
-          bool kHasWeight>
+          bool kHasWeight, bool kRanged>
 void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
     kernel_combine_internode(ncclDevComm dev_comm, RDMARailWindowDesc rdma_desc,
                              int32_t *local_topk_indices,
@@ -1525,7 +1689,13 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
                              void *combine_weight_ptrs, int32_t num_token,
                              int32_t num_experts_per_rank, int32_t rank,
                              int32_t num_ranks, int32_t local_world_size,
-                             int32_t num_qps, int32_t combine_pipeline_chunks) {
+                             int32_t num_qps, int32_t combine_pipeline_chunks,
+                             const int32_t *logical_token_range) {
+  if constexpr (kRanged) {
+    if (logical_token_range[1] <= logical_token_range[0]) {
+      return;
+    }
+  }
   static_assert(kWarpsPerWG > 1, "kWarpsPerWG must be greater than 1");
   extern __shared__ __align__(1024) uint8_t smem_buffer[];
   using smem_t =
@@ -1964,16 +2134,23 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
 }
 
 template <typename token_t, typename weight_t, int32_t kHiddenSize,
-          int32_t kTopk, bool kHasWeight>
-void __global__ kernel_combine_internode_reduce(RDMARailWindowDesc rdma_desc,
-                                                void *output,
-                                                void *output_weight,
-                                                int32_t num_token, int32_t rank,
-                                                int32_t num_ranks,
-                                                int32_t local_world_size) {
+          int32_t kTopk, bool kHasWeight, bool kRanged>
+void __global__ kernel_combine_internode_reduce(
+    RDMARailWindowDesc rdma_desc, void *output, void *output_weight,
+    int32_t num_token, int32_t *num_tokens_per_rank, int32_t rank,
+    int32_t num_ranks, int32_t local_world_size,
+    const int32_t *logical_token_range) {
   constexpr int32_t kElemsPerInt4 = sizeof(int4) / sizeof(token_t);
   constexpr int32_t kHiddenSizeInt4 = kHiddenSize / kElemsPerInt4;
   const int32_t nnodes = num_ranks / local_world_size;
+  int32_t token_output_begin = 0;
+  if constexpr (kRanged) {
+    if (logical_token_range[1] <= logical_token_range[0]) {
+      return;
+    }
+    token_output_begin = max(0, min(logical_token_range[0], num_token));
+    num_token = num_tokens_per_rank[rank];
+  }
   init_rdma_desc_local_base(rdma_desc);
   const int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const int32_t stride = blockDim.x * gridDim.x;
@@ -2018,9 +2195,9 @@ void __global__ kernel_combine_internode_reduce(RDMARailWindowDesc rdma_desc,
         out_converter.bf162[k] =
             __float22bfloat162_rn(make_float2(acc[k * 2], acc[k * 2 + 1]));
       }
-      int4 *dst_vec =
-          reinterpret_cast<int4 *>(reinterpret_cast<token_t *>(output) +
-                                   static_cast<int64_t>(token) * kHiddenSize);
+      int4 *dst_vec = reinterpret_cast<int4 *>(
+          reinterpret_cast<token_t *>(output) +
+          static_cast<int64_t>(token_output_begin + token) * kHiddenSize);
       dst_vec[vec_idx] = out_converter.vec;
     }
 
@@ -2037,7 +2214,9 @@ void __global__ kernel_combine_internode_reduce(RDMARailWindowDesc rdma_desc,
               reinterpret_cast<weight_t *>(slot + rdma_desc.weight_region_off);
           acc += partial_weight[weight_offset];
         }
-        reinterpret_cast<weight_t *>(output_weight)[weight_offset] =
+        const int64_t output_weight_offset =
+            static_cast<int64_t>(token_output_begin + token) * kTopk + topk_idx;
+        reinterpret_cast<weight_t *>(output_weight)[output_weight_offset] =
             static_cast<weight_t>(acc);
       }
     }
@@ -2073,6 +2252,7 @@ void detail::combine_internode_cuda_hidden(
   auto weight_dtype = args.weight_dtype;
   auto offset_dtype = args.offset_dtype;
   auto combine_pipeline_chunks = args.combine_pipeline_chunks;
+  auto logical_token_range = args.logical_token_range;
   auto stream = args.stream;
   const int32_t nnodes = num_ranks / local_world_size;
   ncclDevComm dev_comm = *static_cast<const ncclDevComm *>(dev_comm_host);
@@ -2098,99 +2278,110 @@ void detail::combine_internode_cuda_hidden(
     DISPATCH_WEIGHT_DTYPE(weight_dtype, weight_t, {
       DISPATCH_OFFSET_TYPE(offset_dtype, offset_t, {
         DISPATCH_TOPK(topk, kTopk, {
+          const bool ranged = logical_token_range != nullptr;
           DISPATCH_BOOL(has_weight, kHasWeight, {
-            constexpr int32_t kPreferredLoadStages = 6;
-            constexpr int32_t kMaxFitLoadStages =
-                kernels::smem::MaxCombineLoadStages<
-                    token_t, weight_t, kHiddenSize, kMaxSmemSize,
-                    kNumStoreStages, kNumWGPerBlock>::value;
-            constexpr int32_t kNumLoadStages =
-                kMaxFitLoadStages < kPreferredLoadStages ? kMaxFitLoadStages
-                                                         : kPreferredLoadStages;
-            static_assert(kNumLoadStages >= 2,
-                          "combine_internode: shared memory too small for at "
-                          "least two load stages");
-            static_assert(
-                (kHiddenSize * static_cast<int32_t>(sizeof(token_t))) %
-                        kernels::smem::kTMAAlignment ==
-                    0,
-                "combine_internode: one token row must be TMA aligned");
-            constexpr int32_t kNumComputeWarps = kNumWGPerBlock * kWarpsPerWG;
-            constexpr int32_t kNumWarps =
-                kNumComputeWarps + int(kHasWeight) + 1;
-            static_assert(
-                kNumComputeWarps % kWarpsPerWG == 0,
-                "combine_internode: compute warp groups must be complete");
-            constexpr int32_t kNumThreads = kNumWarps * WARP_SIZE;
-            using smem_t = kernels::smem::CombineIntraNodeSmem<
-                token_t, weight_t, kHiddenSize, kNumLoadStages, kNumStoreStages,
-                kNumWGPerBlock>;
-            constexpr int32_t smem_size = sizeof(smem_t);
-            static_assert(smem_size <= kMaxSmemSize,
-                          "combine_internode: smem_size exceeds kMaxSmemSize");
-            auto kernel_fn = kernels::kernel_combine_internode<
-                token_t, weight_t, offset_t, kTopk, kHiddenSize, kNumLoadStages,
-                kNumStoreStages, kNumWarps, kWarpsPerWG, kElemsPerThread,
-                kHasWeight>;
-            CUDA_CHECK(cudaFuncSetAttribute(
-                kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                smem_size));
-            kernels::RDMARailWindowDesc rdma_desc_arg = rdma_desc;
-            int32_t num_token_arg = num_token;
-            int32_t num_experts_per_rank_arg = num_experts_per_rank;
-            int32_t rank_arg = rank;
-            int32_t num_ranks_arg = num_ranks;
-            int32_t local_world_size_arg = local_world_size;
-            int32_t num_qps_arg = num_qps;
-            int32_t combine_pipeline_chunks_arg = combine_pipeline_chunks;
-            dim3 block_dim(kNumThreads);
-            dim3 grid_dim(num_sm);
-            void *kernel_args[] = {&dev_comm,
-                                   &rdma_desc_arg,
-                                   &local_topk_indices,
-                                   &local_topk_send_mask,
-                                   &local_token_dst_scatter_indices,
-                                   &num_tokens_per_rank,
-                                   &combine_x_ptrs,
-                                   &combine_weight_ptrs,
-                                   &num_token_arg,
-                                   &num_experts_per_rank_arg,
-                                   &rank_arg,
-                                   &num_ranks_arg,
-                                   &local_world_size_arg,
-                                   &num_qps_arg,
-                                   &combine_pipeline_chunks_arg};
-            flash_comm::launch_kernel_ex(
-                reinterpret_cast<const void *>(kernel_fn), grid_dim, block_dim,
-                kernel_args, smem_size, stream, 0, true);
+            DISPATCH_BOOL(ranged, kRanged, {
+              constexpr int32_t kPreferredLoadStages = 6;
+              constexpr int32_t kMaxFitLoadStages =
+                  kernels::smem::MaxCombineLoadStages<
+                      token_t, weight_t, kHiddenSize, kMaxSmemSize,
+                      kNumStoreStages, kNumWGPerBlock>::value;
+              constexpr int32_t kNumLoadStages =
+                  kMaxFitLoadStages < kPreferredLoadStages
+                      ? kMaxFitLoadStages
+                      : kPreferredLoadStages;
+              static_assert(kNumLoadStages >= 2,
+                            "combine_internode: shared memory too small for at "
+                            "least two load stages");
+              static_assert(
+                  (kHiddenSize * static_cast<int32_t>(sizeof(token_t))) %
+                          kernels::smem::kTMAAlignment ==
+                      0,
+                  "combine_internode: one token row must be TMA aligned");
+              constexpr int32_t kNumComputeWarps = kNumWGPerBlock * kWarpsPerWG;
+              constexpr int32_t kNumWarps =
+                  kNumComputeWarps + int(kHasWeight) + 1;
+              static_assert(
+                  kNumComputeWarps % kWarpsPerWG == 0,
+                  "combine_internode: compute warp groups must be complete");
+              constexpr int32_t kNumThreads = kNumWarps * WARP_SIZE;
+              using smem_t = kernels::smem::CombineIntraNodeSmem<
+                  token_t, weight_t, kHiddenSize, kNumLoadStages,
+                  kNumStoreStages, kNumWGPerBlock>;
+              constexpr int32_t smem_size = sizeof(smem_t);
+              static_assert(
+                  smem_size <= kMaxSmemSize,
+                  "combine_internode: smem_size exceeds kMaxSmemSize");
+              auto kernel_fn = kernels::kernel_combine_internode<
+                  token_t, weight_t, offset_t, kTopk, kHiddenSize,
+                  kNumLoadStages, kNumStoreStages, kNumWarps, kWarpsPerWG,
+                  kElemsPerThread, kHasWeight, kRanged>;
+              CUDA_CHECK(cudaFuncSetAttribute(
+                  kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                  smem_size));
+              kernels::RDMARailWindowDesc rdma_desc_arg = rdma_desc;
+              int32_t num_token_arg = num_token;
+              int32_t num_experts_per_rank_arg = num_experts_per_rank;
+              int32_t rank_arg = rank;
+              int32_t num_ranks_arg = num_ranks;
+              int32_t local_world_size_arg = local_world_size;
+              int32_t num_qps_arg = num_qps;
+              int32_t combine_pipeline_chunks_arg = combine_pipeline_chunks;
+              const int32_t *logical_token_range_arg = logical_token_range;
+              dim3 block_dim(kNumThreads);
+              dim3 grid_dim(num_sm);
+              void *kernel_args[] = {&dev_comm,
+                                     &rdma_desc_arg,
+                                     &local_topk_indices,
+                                     &local_topk_send_mask,
+                                     &local_token_dst_scatter_indices,
+                                     &num_tokens_per_rank,
+                                     &combine_x_ptrs,
+                                     &combine_weight_ptrs,
+                                     &num_token_arg,
+                                     &num_experts_per_rank_arg,
+                                     &rank_arg,
+                                     &num_ranks_arg,
+                                     &local_world_size_arg,
+                                     &num_qps_arg,
+                                     &combine_pipeline_chunks_arg,
+                                     &logical_token_range_arg};
+              flash_comm::launch_kernel_ex(
+                  reinterpret_cast<const void *>(kernel_fn), grid_dim,
+                  block_dim, kernel_args, smem_size, stream, 0, true);
 
-            constexpr int32_t kReduceThreads = 256;
-            constexpr int32_t kReduceElemsPerInt4 =
-                sizeof(int4) / sizeof(token_t);
-            constexpr int32_t kReduceHiddenSizeInt4 =
-                kHiddenSize / kReduceElemsPerInt4;
-            const int64_t token_vec_work =
-                static_cast<int64_t>(num_token) * kReduceHiddenSizeInt4;
-            const int64_t weight_work =
-                kHasWeight ? static_cast<int64_t>(num_token) * kTopk : 0;
-            const int64_t reduce_work =
-                token_vec_work > weight_work ? token_vec_work : weight_work;
-            if (reduce_work > 0) {
-              const int64_t min_grid =
-                  (reduce_work + kReduceThreads - 1) / kReduceThreads;
-              // The reduce is HBM-bandwidth bound; 2048 CTAs of 256 threads
-              // already oversubscribe every current part (H800: 132 SMs),
-              // so larger grids only add launch/tail overhead. Beyond this
-              // the grid-stride loop covers the remaining work.
-              constexpr int32_t max_hbm_grid = 2048;
-              const int32_t reduce_grid = static_cast<int32_t>(
-                  min_grid < max_hbm_grid ? min_grid : max_hbm_grid);
-              kernels::kernel_combine_internode_reduce<
-                  token_t, weight_t, kHiddenSize, kTopk, kHasWeight>
-                  <<<reduce_grid, kReduceThreads, 0, stream>>>(
-                      rdma_desc, output, output_weight, num_token, rank,
-                      num_ranks, local_world_size);
-            }
+              constexpr int32_t kReduceThreads = 256;
+              constexpr int32_t kReduceElemsPerInt4 =
+                  sizeof(int4) / sizeof(token_t);
+              constexpr int32_t kReduceHiddenSizeInt4 =
+                  kHiddenSize / kReduceElemsPerInt4;
+              const int32_t launch_num_token = num_token;
+              const int64_t token_vec_work =
+                  static_cast<int64_t>(launch_num_token) *
+                  kReduceHiddenSizeInt4;
+              const int64_t weight_work =
+                  kHasWeight ? static_cast<int64_t>(launch_num_token) * kTopk
+                             : 0;
+              const int64_t reduce_work =
+                  token_vec_work > weight_work ? token_vec_work : weight_work;
+              if (reduce_work > 0) {
+                const int64_t min_grid =
+                    (reduce_work + kReduceThreads - 1) / kReduceThreads;
+                // The reduce is HBM-bandwidth bound; 2048 CTAs of 256 threads
+                // already oversubscribe every current part (H800: 132 SMs),
+                // so larger grids only add launch/tail overhead. Beyond this
+                // the grid-stride loop covers the remaining work.
+                constexpr int32_t max_hbm_grid = 2048;
+                const int32_t reduce_grid = static_cast<int32_t>(
+                    min_grid < max_hbm_grid ? min_grid : max_hbm_grid);
+                kernels::kernel_combine_internode_reduce<
+                    token_t, weight_t, kHiddenSize, kTopk, kHasWeight, kRanged>
+                    <<<reduce_grid, kReduceThreads, 0, stream>>>(
+                        rdma_desc, output, output_weight, num_token,
+                        num_tokens_per_rank, rank, num_ranks, local_world_size,
+                        logical_token_range);
+              }
+            });
           });
         });
       });

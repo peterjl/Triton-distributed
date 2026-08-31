@@ -24,6 +24,7 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstdint>
 
 #include "flash_comm/common.h"
@@ -257,6 +258,17 @@ template <typename T>
 void __global__ __launch_bounds__(128, 1)
     kernel_barrier_all_on_stream(T **barrier_ptrs, int32_t rank,
                                  int32_t num_ranks) {
+  barrier_all_block<T>(reinterpret_cast<T **>(barrier_ptrs), rank, num_ranks);
+}
+
+template <typename T>
+void __global__ __launch_bounds__(128, 1)
+    kernel_barrier_all_on_stream_range(T **barrier_ptrs, int32_t rank,
+                                       int32_t num_ranks,
+                                       const int32_t *logical_token_range) {
+  if (logical_token_range[1] <= logical_token_range[0]) {
+    return;
+  }
   barrier_all_block<T>(reinterpret_cast<T **>(barrier_ptrs), rank, num_ranks);
 }
 
@@ -592,7 +604,7 @@ __launch_bounds__(kNumWarps *WARP_SIZE, 1) kernel_compute_dispatch_layout(
 // ballot/shuffle, keeping multiple TMA stores in flight.
 template <typename token_t, typename weight_t, typename offset_t,
           int32_t kHiddenSize, int32_t kTopk, int32_t kNumStages,
-          int32_t kNumConsumerGroups, bool kHasWeight>
+          int32_t kNumConsumerGroups, bool kHasWeight, bool kRanged>
 void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
     kernel_dispatch_intranode(
         void *x,                             // [num_token, hidden_size]
@@ -601,7 +613,7 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
         offset_t *topk_indices,              // [num_token, topk]
         offset_t *token_dst_scatter_indices, // [num_token, topk]
         int32_t num_token, int32_t hidden_size, int32_t num_experts_per_rank,
-        int32_t rank, int32_t num_ranks,
+        int32_t rank, int32_t num_ranks, const int32_t *logical_token_range,
         // outputs
         void *recv_x_ptrs, // [num_ranks], recv_x [num_recv_token, hidden_size]
         void **recv_weights_ptrs, // [num_ranks], recv_weights [num_recv_token,
@@ -627,6 +639,20 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
   const int num_block = gridDim.x;
   const int warp_id = thread_id / WARP_SIZE;
   const int lane_id = thread_id % WARP_SIZE;
+  int32_t token_begin = 0;
+  int32_t token_end = num_token;
+  if constexpr (kRanged) {
+    const int32_t logical_begin = logical_token_range[0];
+    const int32_t logical_end = logical_token_range[1];
+    if (logical_end <= logical_begin) {
+      return;
+    }
+    token_begin = max(0, min(logical_begin, num_token));
+    token_end = max(0, min(logical_end, num_token));
+    if (token_end <= token_begin) {
+      return;
+    }
+  }
   // TMA store pipeline depth
   constexpr int32_t kStorePipe = 2;
 
@@ -669,7 +695,7 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
   const int32_t num_bytes_per_token = hidden_size * sizeof(token_t);
 
   if (is_producer_warp) {
-    for (int token_offset = block_id; token_offset < num_token;
+    for (int token_offset = token_begin + block_id; token_offset < token_end;
          token_offset += num_block) {
       token_t *src_gmem_ptr =
           offset_ptr(reinterpret_cast<token_t *>(x), token_offset, hidden_size);
@@ -699,8 +725,9 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
     int32_t tokens_processed = 0;
 
     const uint32_t is_leader_lane = elect_one_sync();
-    for (int token_offset = block_id + consumer_group_id * num_block;
-         token_offset < num_token;
+    for (int token_offset =
+             token_begin + block_id + consumer_group_id * num_block;
+         token_offset < token_end;
          token_offset += num_block * kNumConsumerGroups) {
       uint64_t *cur_mbar_full_ptr = mbar_full_ptr + consumer_pipe_state.index();
 
@@ -711,11 +738,13 @@ void __global__ __launch_bounds__((1 + kNumConsumerGroups) * WARP_SIZE, 1)
       weight_t my_weight = 0;
 
       if (lane_id < kTopk) {
+        const int32_t meta_token_offset =
+            kRanged ? token_offset - token_begin : token_offset;
         my_expert_idx = topk_indices[token_offset * kTopk + lane_id];
         my_target_rank = my_expert_idx / num_experts_per_rank;
-        my_is_need_send = topk_send_mask[token_offset * kTopk + lane_id];
+        my_is_need_send = topk_send_mask[meta_token_offset * kTopk + lane_id];
         my_store_idx =
-            token_dst_scatter_indices[token_offset * kTopk + lane_id];
+            token_dst_scatter_indices[meta_token_offset * kTopk + lane_id];
         if constexpr (kHasWeight) {
           my_weight = reinterpret_cast<weight_t *>(
               topk_weights)[token_offset * kTopk + lane_id];
@@ -1036,7 +1065,7 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
 template <typename token_t, typename weight_t, typename offset_t, int32_t kTopk,
           int32_t kHiddenSize, int32_t kNumLoadStages, int32_t kNumStoreStages,
           int32_t kNumWarps, int32_t kWarpsPerWG, int32_t kElemsPerThread,
-          bool kHasWeight = false>
+          bool kHasWeight = false, bool kRanged = false>
 void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
     kernel_combine_intranode(
         void *x_ptrs,                        // [num_ranks]
@@ -1047,7 +1076,7 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
         void *recv_x,                        // [num_token, hidden_size]
         void *recv_weight,                   // [num_token, topk]
         int32_t num_token, int32_t num_experts_per_rank, int32_t rank,
-        int32_t num_ranks) {
+        int32_t num_ranks, const int32_t *logical_token_range) {
   static_assert(kWarpsPerWG > 1, "kWarpsPerWG must be greater than 1");
   extern __shared__ __align__(1024) uint8_t smem_buffer[];
   const int thread_id = threadIdx.x;
@@ -1055,6 +1084,20 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
   const int num_block = gridDim.x;
   const int warp_id = thread_id / WARP_SIZE;
   const int lane_id = thread_id % WARP_SIZE;
+  int32_t token_begin = 0;
+  int32_t token_end = num_token;
+  if constexpr (kRanged) {
+    const int32_t logical_begin = logical_token_range[0];
+    const int32_t logical_end = logical_token_range[1];
+    if (logical_end <= logical_begin) {
+      return;
+    }
+    token_begin = max(0, min(logical_begin, num_token));
+    token_end = max(0, min(logical_end, num_token));
+    if (token_end <= token_begin) {
+      return;
+    }
+  }
   constexpr int32_t kNumWGPerBlock =
       kHasWeight ? (kNumWarps - 1) / kWarpsPerWG : kNumWarps / kWarpsPerWG;
   constexpr int32_t kElemsPerInt4 = sizeof(int4) / sizeof(token_t);
@@ -1127,15 +1170,19 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
     if (warp_id == kNumWarps - 1) {
       int32_t total_weight_warps = num_block;
       int32_t total_weight_threads = total_weight_warps * WARP_SIZE;
-      int32_t num_weights = num_token * kTopk;
-      int32_t global_weight_thread_id = lane_id + block_id * WARP_SIZE;
-      for (int i = global_weight_thread_id; i < num_weights;
+      int32_t weight_begin = token_begin * kTopk;
+      int32_t weight_end = token_end * kTopk;
+      int32_t global_weight_thread_id =
+          weight_begin + lane_id + block_id * WARP_SIZE;
+      for (int i = global_weight_thread_id; i < weight_end;
            i += total_weight_threads) {
         int32_t token_offset = i / kTopk;
+        const int32_t meta_token_offset =
+            kRanged ? token_offset - token_begin : token_offset;
         int32_t topk_idx = i % kTopk;
         int32_t expert_idx = topk_indices[token_offset * kTopk + topk_idx];
         int32_t scatter_idx =
-            token_dst_scatter_indices[token_offset * kTopk + topk_idx];
+            token_dst_scatter_indices[meta_token_offset * kTopk + topk_idx];
         int32_t expert_rank = expert_idx / num_experts_per_rank;
         bool is_valid_lane = (expert_rank < num_ranks) && (scatter_idx != -1);
         weight_t valid_weight = 0;
@@ -1162,8 +1209,8 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
   const int32_t consumer_tid_in_wg =
       thread_id % (WARP_SIZE * kWarpsPerWG) - WARP_SIZE;
   if (is_tma_load_warp) {
-    for (int token_offset = global_warp_group_id; token_offset < num_token;
-         token_offset += total_warp_groups) {
+    for (int token_offset = token_begin + global_warp_group_id;
+         token_offset < token_end; token_offset += total_warp_groups) {
 
       int32_t expert_rank_lane = 0;
       int32_t scatter_idx_lane = 0;
@@ -1172,11 +1219,14 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
       static_assert(kTopk <= WARP_SIZE,
                     "kTopk must be less than or equal to WARP_SIZE");
       if (lane_id < kTopk) {
+        const int32_t meta_token_offset =
+            kRanged ? token_offset - token_begin : token_offset;
         int32_t expert_idx = topk_indices[token_offset * kTopk + lane_id];
         expert_rank_lane = expert_idx / num_experts_per_rank;
-        int32_t is_need_send = topk_send_mask[token_offset * kTopk + lane_id];
+        int32_t is_need_send =
+            topk_send_mask[meta_token_offset * kTopk + lane_id];
         scatter_idx_lane =
-            token_dst_scatter_indices[token_offset * kTopk + lane_id];
+            token_dst_scatter_indices[meta_token_offset * kTopk + lane_id];
         is_valid_lane = expert_rank_lane < num_ranks and is_need_send;
       }
 
@@ -1228,14 +1278,18 @@ void __global__ __launch_bounds__(kNumWarps *WARP_SIZE, 1)
 
     const uint32_t is_leader_lane = elect_one_sync();
     int32_t token_iter = 0;
-    for (int token_offset = global_warp_group_id; token_offset < num_token;
+    for (int token_offset = token_begin + global_warp_group_id;
+         token_offset < token_end;
          token_offset += total_warp_groups, ++token_iter) {
       int32_t is_valid_lane = 0;
 
       if (lane_id < kTopk) {
+        const int32_t meta_token_offset =
+            kRanged ? token_offset - token_begin : token_offset;
         int32_t expert_idx = topk_indices[token_offset * kTopk + lane_id];
         int32_t expert_rank = expert_idx / num_experts_per_rank;
-        int32_t is_need_send = topk_send_mask[token_offset * kTopk + lane_id];
+        int32_t is_need_send =
+            topk_send_mask[meta_token_offset * kTopk + lane_id];
         is_valid_lane = (expert_rank < num_ranks) && is_need_send;
       }
 
@@ -1362,10 +1416,13 @@ void compute_stable_local_token_within_expert_offset_cuda(
     CUDA_CHECK(cudaDeviceGetAttribute(&device_sm_count,
                                       cudaDevAttrMultiProcessorCount, device));
   }
+  // Empty local ranks are valid EP inputs.  Keep one cooperative CTA for the
+  // zero-tile case so the kernel still executes its normal expert-count and
+  // output initialization logic; a zero-sized grid is an invalid launch.
   if (num_sm <= 0) {
     num_sm = (num_token * topk + kNumThreads - 1) / kNumThreads;
   }
-  num_sm = (num_sm < device_sm_count) ? num_sm : device_sm_count;
+  num_sm = std::max(1, std::min(num_sm, device_sm_count));
 
   dim3 block_dim(kNumThreads);
   dim3 grid_dim(num_sm);
@@ -1436,15 +1493,15 @@ void compute_dispatch_layout_cuda(
   CUDA_CHECK(cudaGetLastError());
 }
 
-void dispatch_intranode_cuda(
+static void dispatch_intranode_cuda_impl(
     void *x, void *topk_send_mask, void *topk_weights, void *topk_indices,
     void *token_dst_scatter_indices, void *recv_x_ptrs,
     void **recv_weights_ptrs, void **recv_topk_scatter_indices_ptrs,
     int32_t num_token, int32_t hidden_size, int32_t num_experts_per_rank,
     int32_t rank, int32_t num_ranks, int32_t num_sm,
     flash_comm::FlashCommDType dtype, flash_comm::FlashCommDType weight_dtype,
-    flash_comm::FlashCommDType offset_dtype, int32_t topk,
-    cudaStream_t stream) {
+    flash_comm::FlashCommDType offset_dtype, int32_t topk, cudaStream_t stream,
+    const int32_t *logical_token_range) {
   constexpr int32_t kNumConsumerGroups = 3;
   constexpr int32_t kMaxSmemSize = flash_comm::kMaxSmemBytes;
   constexpr int32_t kPreferredStages = 12;
@@ -1488,26 +1545,30 @@ void dispatch_intranode_cuda(
             constexpr int32_t smem_size = sizeof(smem_t);
             static_assert(smem_size <= kMaxSmemSize,
                           "smem_size exceeds kMaxSmemSize");
+            const bool ranged = logical_token_range != nullptr;
             DISPATCH_BOOL(has_weight, kHasWeight, {
-              CUDA_CHECK(cudaFuncSetAttribute(
-                  kernels::kernel_dispatch_intranode<
-                      token_t, weight_t, offset_t, kHiddenSize, kTopk,
-                      kNumStages, kNumConsumerGroups, kHasWeight>,
-                  cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-              flash_comm::launch_kernel_ex(
-                  kernels::kernel_dispatch_intranode<
-                      token_t, weight_t, offset_t, kHiddenSize, kTopk,
-                      kNumStages, kNumConsumerGroups, kHasWeight>,
-                  grid_dim, block_dim, smem_size, stream,
-                  flash_comm::internal::get_cga_cluster_size(), x,
-                  reinterpret_cast<int32_t *>(topk_send_mask),
-                  kHasWeight ? topk_weights : nullptr,
-                  reinterpret_cast<offset_t *>(topk_indices),
-                  reinterpret_cast<offset_t *>(token_dst_scatter_indices),
-                  num_token, hidden_size, num_experts_per_rank, rank, num_ranks,
-                  recv_x_ptrs, recv_weights_ptrs,
-                  reinterpret_cast<offset_t **>(
-                      recv_topk_scatter_indices_ptrs));
+              DISPATCH_BOOL(ranged, kRanged, {
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    kernels::kernel_dispatch_intranode<
+                        token_t, weight_t, offset_t, kHiddenSize, kTopk,
+                        kNumStages, kNumConsumerGroups, kHasWeight, kRanged>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                flash_comm::launch_kernel_ex(
+                    kernels::kernel_dispatch_intranode<
+                        token_t, weight_t, offset_t, kHiddenSize, kTopk,
+                        kNumStages, kNumConsumerGroups, kHasWeight, kRanged>,
+                    grid_dim, block_dim, smem_size, stream,
+                    flash_comm::internal::get_cga_cluster_size(), x,
+                    reinterpret_cast<int32_t *>(topk_send_mask),
+                    kHasWeight ? topk_weights : nullptr,
+                    reinterpret_cast<offset_t *>(topk_indices),
+                    reinterpret_cast<offset_t *>(token_dst_scatter_indices),
+                    num_token, hidden_size, num_experts_per_rank, rank,
+                    num_ranks, logical_token_range, recv_x_ptrs,
+                    recv_weights_ptrs,
+                    reinterpret_cast<offset_t **>(
+                        recv_topk_scatter_indices_ptrs));
+              });
             });
           });
         });
@@ -1515,6 +1576,22 @@ void dispatch_intranode_cuda(
     });
   });
   CUDA_CHECK(cudaGetLastError());
+}
+
+void dispatch_intranode_cuda(
+    void *x, void *topk_send_mask, void *topk_weights, void *topk_indices,
+    void *token_dst_scatter_indices, void *recv_x_ptrs,
+    void **recv_weights_ptrs, void **recv_topk_scatter_indices_ptrs,
+    int32_t num_token, int32_t hidden_size, int32_t num_experts_per_rank,
+    int32_t rank, int32_t num_ranks, int32_t num_sm,
+    flash_comm::FlashCommDType dtype, flash_comm::FlashCommDType weight_dtype,
+    flash_comm::FlashCommDType offset_dtype, int32_t topk,
+    const int32_t *logical_token_range, cudaStream_t stream) {
+  dispatch_intranode_cuda_impl(
+      x, topk_send_mask, topk_weights, topk_indices, token_dst_scatter_indices,
+      recv_x_ptrs, recv_weights_ptrs, recv_topk_scatter_indices_ptrs, num_token,
+      hidden_size, num_experts_per_rank, rank, num_ranks, num_sm, dtype,
+      weight_dtype, offset_dtype, topk, stream, logical_token_range);
 }
 
 void dispatch_postprocess_cuda(
@@ -1597,14 +1674,15 @@ void dispatch_postprocess_cuda(
   CUDA_CHECK(cudaGetLastError());
 }
 
-void combine_intranode_cuda(
+static void combine_intranode_cuda_impl(
     void *x_ptrs, void *weight_ptrs, void *topk_send_mask, void *topk_indices,
     void *token_dst_scatter_indices, void *recv_x, void *recv_weight,
-    int32_t num_token, int32_t hidden_size, int32_t topk,
+    bool has_weight, int32_t num_token, int32_t hidden_size, int32_t topk,
     int32_t num_experts_per_rank, int32_t rank, int32_t num_ranks,
     int32_t num_sm, flash_comm::FlashCommDType dtype,
     flash_comm::FlashCommDType weight_dtype,
-    flash_comm::FlashCommDType offset_dtype, cudaStream_t stream) {
+    flash_comm::FlashCommDType offset_dtype, cudaStream_t stream,
+    const int32_t *logical_token_range) {
   constexpr int32_t kNumStoreStages = 2;
   constexpr int32_t kElemsPerThread = 64;
 
@@ -1612,9 +1690,9 @@ void combine_intranode_cuda(
   constexpr int32_t kNumWGPerBlock = 2;
 
   constexpr int32_t kMaxSmemSize = flash_comm::kMaxSmemBytes;
-  FLASH_CHECK((weight_ptrs != nullptr) == (recv_weight != nullptr))
-      << "weight_ptrs and recv_weight must be both nullptr or both not nullptr";
-  bool has_weight = weight_ptrs != nullptr;
+  FLASH_CHECK(!has_weight || weight_ptrs != nullptr);
+  FLASH_CHECK(!has_weight || recv_weight != nullptr || num_token == 0);
+  FLASH_CHECK(has_weight || (weight_ptrs == nullptr && recv_weight == nullptr));
   DISPATCH_TOKEN_DTYPE(dtype, token_t, {
     DISPATCH_WEIGHT_DTYPE(weight_dtype, weight_t, {
       DISPATCH_OFFSET_TYPE(offset_dtype, offset_t, {
@@ -1660,26 +1738,29 @@ void combine_intranode_cuda(
               constexpr int32_t smem_size = sizeof(smem_t);
               static_assert(smem_size <= kMaxSmemSize,
                             "smem_size exceeds kMaxSmemSize");
-              CUDA_CHECK(cudaFuncSetAttribute(
-                  kernels::kernel_combine_intranode<
-                      token_t, weight_t, offset_t, kTopk, kHiddenSize,
-                      kNumLoadStages, kNumStoreStages, kNumWarps, kWarpsPerWG,
-                      kElemsPerThread, kHasWeight>,
-                  cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-              dim3 block_dim(kNumThreads);
-              dim3 grid_dim(num_sm);
-              flash_comm::launch_kernel_ex(
-                  kernels::kernel_combine_intranode<
-                      token_t, weight_t, offset_t, kTopk, kHiddenSize,
-                      kNumLoadStages, kNumStoreStages, kNumWarps, kWarpsPerWG,
-                      kElemsPerThread, kHasWeight>,
-                  grid_dim, block_dim, smem_size, stream,
-                  flash_comm::internal::get_cga_cluster_size(), x_ptrs,
-                  weight_ptrs, reinterpret_cast<offset_t *>(topk_send_mask),
-                  reinterpret_cast<offset_t *>(topk_indices),
-                  reinterpret_cast<offset_t *>(token_dst_scatter_indices),
-                  recv_x, recv_weight, num_token, num_experts_per_rank, rank,
-                  num_ranks);
+              const bool ranged = logical_token_range != nullptr;
+              DISPATCH_BOOL(ranged, kRanged, {
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    kernels::kernel_combine_intranode<
+                        token_t, weight_t, offset_t, kTopk, kHiddenSize,
+                        kNumLoadStages, kNumStoreStages, kNumWarps, kWarpsPerWG,
+                        kElemsPerThread, kHasWeight, kRanged>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                dim3 block_dim(kNumThreads);
+                dim3 grid_dim(num_sm);
+                flash_comm::launch_kernel_ex(
+                    kernels::kernel_combine_intranode<
+                        token_t, weight_t, offset_t, kTopk, kHiddenSize,
+                        kNumLoadStages, kNumStoreStages, kNumWarps, kWarpsPerWG,
+                        kElemsPerThread, kHasWeight, kRanged>,
+                    grid_dim, block_dim, smem_size, stream,
+                    flash_comm::internal::get_cga_cluster_size(), x_ptrs,
+                    weight_ptrs, reinterpret_cast<offset_t *>(topk_send_mask),
+                    reinterpret_cast<offset_t *>(topk_indices),
+                    reinterpret_cast<offset_t *>(token_dst_scatter_indices),
+                    recv_x, recv_weight, num_token, num_experts_per_rank, rank,
+                    num_ranks, logical_token_range);
+              });
             });
           });
         });
@@ -1687,6 +1768,22 @@ void combine_intranode_cuda(
     });
   });
   CUDA_CHECK(cudaGetLastError());
+}
+
+void combine_intranode_cuda(
+    void *x_ptrs, void *weight_ptrs, void *topk_send_mask, void *topk_indices,
+    void *token_dst_scatter_indices, void *recv_x, void *recv_weight,
+    bool has_weight, int32_t num_token, int32_t hidden_size, int32_t topk,
+    int32_t num_experts_per_rank, int32_t rank, int32_t num_ranks,
+    int32_t num_sm, flash_comm::FlashCommDType dtype,
+    flash_comm::FlashCommDType weight_dtype,
+    flash_comm::FlashCommDType offset_dtype, const int32_t *logical_token_range,
+    cudaStream_t stream) {
+  combine_intranode_cuda_impl(
+      x_ptrs, weight_ptrs, topk_send_mask, topk_indices,
+      token_dst_scatter_indices, recv_x, recv_weight, has_weight, num_token,
+      hidden_size, topk, num_experts_per_rank, rank, num_ranks, num_sm, dtype,
+      weight_dtype, offset_dtype, stream, logical_token_range);
 }
 
 void combine_preprocess_inplace_cuda(
@@ -1743,6 +1840,20 @@ void barrier_all_on_stream_cuda(void **barrier_ptrs, int32_t rank,
   kernels::kernel_barrier_all_on_stream<int32_t>
       <<<grid_dim, block_dim, 0, stream>>>(
           reinterpret_cast<int32_t **>(barrier_ptrs), rank, num_ranks);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void barrier_all_on_stream_range_cuda(void **barrier_ptrs, int32_t rank,
+                                      int32_t num_ranks,
+                                      const int32_t *logical_token_range,
+                                      cudaStream_t stream) {
+  FLASH_CHECK(rank >= 0 && rank < num_ranks);
+  FLASH_CHECK(logical_token_range != nullptr);
+  constexpr int32_t kNumThreads = 128;
+  kernels::kernel_barrier_all_on_stream_range<int32_t>
+      <<<1, kNumThreads, 0, stream>>>(
+          reinterpret_cast<int32_t **>(barrier_ptrs), rank, num_ranks,
+          logical_token_range);
   CUDA_CHECK(cudaGetLastError());
 }
 

@@ -56,6 +56,7 @@ struct DispatchInternodeArgs {
   FlashCommDType offset_dtype;
   int32_t topk;
   int32_t dispatch_pipeline_chunks;
+  const int32_t *logical_token_range;
   cudaStream_t stream;
 };
 
@@ -84,6 +85,7 @@ struct CombineInternodeArgs {
   FlashCommDType weight_dtype;
   FlashCommDType offset_dtype;
   int32_t combine_pipeline_chunks;
+  const int32_t *logical_token_range;
   cudaStream_t stream;
 };
 

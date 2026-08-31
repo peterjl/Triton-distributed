@@ -28,44 +28,17 @@ import os
 import time
 
 import torch
-import torch.distributed as dist
 
-import flash_comm._C.buffer as _buffer
+import flash_comm._C.ep_chunk_plan as _chunk_plan
 import flash_comm._C.ep_internode as _ep_inter
 import flash_comm._C.ep_intranode as _ep
 
+from .chunk_plan import EPChunkPlan
 from .ep_context import EPContext
-
-# Single source of truth lives in C++ (flash_comm/ep/internode.h) and is
-# exported through pybind; do not hardcode these values in Python.
-_MAX_DISPATCH_PIPELINE_CHUNKS = int(_ep_inter.MAX_DISPATCH_PIPELINE_CHUNKS)
-_MAX_COMBINE_PIPELINE_CHUNKS = int(_ep_inter.MAX_COMBINE_PIPELINE_CHUNKS)
-
-
-def _optional_positive_int_env(name: str) -> int | None:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return None
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}") from exc
-    if parsed <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {parsed}")
-    return parsed
-
-
-def _resolve_pipeline_chunks(name: str, max_value: int) -> int:
-    chunks = _optional_positive_int_env(name)
-    if chunks is None:
-        return 1
-    if chunks > max_value:
-        raise ValueError(f"{name} must be in [1, {max_value}], got {chunks}")
-    return chunks
-
-
-def _round_up(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
+from .nccl_gin import (
+    acquire_nccl_gin,
+    release_nccl_gin,
+)
 
 
 @dataclasses.dataclass
@@ -78,7 +51,7 @@ class EPCommLayoutDesc:
     recv_base_offset: torch.Tensor | None = None  # [world_size, experts_per_rank, world_size]
 
     # ------------------------------------------------------------------
-    # Send plan (SENDER-side, [num_token, topk]).
+    # Send plan (SENDER-side, physical shape [num_token, topk]).
     #
     # These are pure outputs of compute_dispatch_layout: they depend only on the
     # local routing and are indexed by *sender-side* input-token rows. They are
@@ -90,6 +63,13 @@ class EPCommLayoutDesc:
     #   physically sent (0 when a same-target earlier choice already covers it).
     # - topk_indices[t, k]: the local routing (intranode combine consumes it;
     #   internode combine uses node_topk_indices instead).
+    #
+    # For a chunk-plan descriptor, the metadata is step-local: only the
+    # prefix [0, logical_token_range[1] - logical_token_range[0]) is valid,
+    # and range kernels index that prefix relative to the step begin. Standard
+    # descriptors have no logical range and consume the whole tensor. Keeping
+    # this contract uniform avoids mixing step-local receive metadata with
+    # full-input sender metadata in one descriptor.
     #
     # Intranode dispatch/combine consume these directly. Internode dispatch
     # copies token_dst_scatter_indices / token_topk_send_mask into the RDMA rail
@@ -133,6 +113,9 @@ class EPCommLayoutDesc:
     # sender-space tensors to restage the RDMA source slot.
     internode_sender_topk_send_mask: torch.Tensor | None = None  # [num_tokens, topk]
     internode_sender_token_dst_scatter_indices: torch.Tensor | None = None  # [num_tokens, topk]
+    # Chunk-plan-only active input rows [begin, end). Standard EP leaves this
+    # unset and processes the whole input.
+    logical_token_range: torch.Tensor | None = None
 
     def check_combine_required_inputs(self):
         # Intranode combine consumes the sender-side send plan directly.
@@ -266,9 +249,9 @@ class EPKernels:
     """
     FlashComm EP kernels.
 
-    Internode EP owns one process-global NCCL GIN communicator and one RDMA rail
-    buffer per EPKernels instance.  Dispatch/combine calls must be serialized;
-    overlapping calls would race on those protocol slots.
+    Internode EP holds a lease on the process-global NCCL GIN communicator and
+    owns one RDMA rail buffer per EPKernels instance. Dispatch/combine calls
+    must be serialized; overlapping calls would race on those protocol slots.
     """
 
     def __init__(self, max_m: int, hidden: int, topk: int, num_experts: int, local_world_size: int,
@@ -292,7 +275,7 @@ class EPKernels:
         self.check_num_worst_tokens = check_num_worst_tokens
 
         self.is_internode = self.world_size > local_world_size
-        self._owns_nccl_gin = False
+        self._has_nccl_gin_lease = False
         if self.is_internode:
             self._init_internode_nccl_gin()
 
@@ -309,85 +292,19 @@ class EPKernels:
         torch.distributed.barrier(group=ep_group)
 
     def _init_internode_nccl_gin(self) -> None:
-        if _buffer.nccl_gin_is_initialized():
-            gin_rank = _buffer.nccl_gin_rank()
-            gin_nranks = _buffer.nccl_gin_nranks()
-            gin_local_world_size = _buffer.nccl_gin_local_world_size()
-            if (gin_rank != self.rank or gin_nranks != self.world_size
-                    or gin_local_world_size != self.local_world_size):
-                raise ValueError("Existing NCCL GIN communicator does not match this EP group: "
-                                 f"rank/nranks/local_world_size="
-                                 f"{gin_rank}/{gin_nranks}/{gin_local_world_size}, expected "
-                                 f"{self.rank}/{self.world_size}/{self.local_world_size}")
-            lsa_size = _buffer.nccl_gin_lsa_size()
-            lsa_rank = _buffer.nccl_gin_lsa_rank()
-            if lsa_size < self.local_world_size or (lsa_rank % self.local_world_size) != (self.rank %
-                                                                                          self.local_world_size):
-                raise ValueError("Existing NCCL GIN LSA team must cover local_world_size/local_rank")
-            nnodes = self.world_size // self.local_world_size
-            self._dispatch_signal_range = (0, int(_ep_inter.ep_dispatch_signal_count(nnodes)))
-            self._combine_signal_range = (int(_ep_inter.ep_combine_signal_base(nnodes)),
-                                          int(_ep_inter.ep_required_gin_signal_count(nnodes)))
-            self._owns_nccl_gin = False
-            return
-
-        ep_num_qps = _optional_positive_int_env("FLASH_COMM_EP_NUM_QPS") or 1
-        gin_contexts = ep_num_qps
-
-        root_global_rank = torch.distributed.get_global_rank(self.ep_group, 0)
-        uid = [_buffer.nccl_gin_get_unique_id() if self.rank == 0 else None]
-        dist.broadcast_object_list(uid, src=root_global_rank, group=self.ep_group)
-        nnodes = self.world_size // self.local_world_size
-        root_ep_num_qps = [ep_num_qps if self.rank == 0 else None]
-        dist.broadcast_object_list(root_ep_num_qps, src=root_global_rank, group=self.ep_group)
-        if ep_num_qps != root_ep_num_qps[0]:
-            raise ValueError("FLASH_COMM_EP_NUM_QPS must be identical across the EP group: "
-                             f"rank {self.rank} has {ep_num_qps}, root has {root_ep_num_qps[0]}")
-        dispatch_chunks = _resolve_pipeline_chunks("FLASH_COMM_EP_DISPATCH_PIPELINE_CHUNKS",
-                                                   _MAX_DISPATCH_PIPELINE_CHUNKS)
-        combine_chunks = _resolve_pipeline_chunks("FLASH_COMM_EP_COMBINE_PIPELINE_CHUNKS", _MAX_COMBINE_PIPELINE_CHUNKS)
-        root_chunks = [(dispatch_chunks, combine_chunks) if self.rank == 0 else None]
-        dist.broadcast_object_list(root_chunks, src=root_global_rank, group=self.ep_group)
-        if (dispatch_chunks, combine_chunks) != root_chunks[0]:
-            raise ValueError("FLASH_COMM_EP_DISPATCH_PIPELINE_CHUNKS and "
-                             "FLASH_COMM_EP_COMBINE_PIPELINE_CHUNKS must be identical "
-                             "across the EP group: "
-                             f"rank {self.rank} has {(dispatch_chunks, combine_chunks)}, "
-                             f"root has {root_chunks[0]}")
-        gin_signals = max(
-            16,
-            _round_up(int(_ep_inter.ep_required_gin_signal_count(nnodes)), 16),
-        )
-        gin_rail_barriers = max(16, self.num_sm)
-        gin_queue_depth = 4096
-        _buffer.nccl_gin_init(uid[0], self.rank, self.world_size, self.local_world_size,
-                              gin_contexts, gin_signals, gin_rail_barriers, gin_queue_depth,
-                              int(_buffer.NCCL_GIN_CONNECTION_FULL), ep_num_qps=ep_num_qps)
-        # Context-local EP GIN signal id ranges (see flash_comm/ep/internode.h).
-        # The fused reset+barrier after each dispatch/combine resets its
-        # protocol range on every context.
-        self._dispatch_signal_range = (0, int(_ep_inter.ep_dispatch_signal_count(nnodes)))
-        self._combine_signal_range = (int(_ep_inter.ep_combine_signal_base(nnodes)),
-                                      int(_ep_inter.ep_required_gin_signal_count(nnodes)))
-        self._owns_nccl_gin = True
-        lsa_size = _buffer.nccl_gin_lsa_size()
-        lsa_rank = _buffer.nccl_gin_lsa_rank()
-        if lsa_size < self.local_world_size or (lsa_rank % self.local_world_size) != (self.rank %
-                                                                                      self.local_world_size):
-            raise ValueError("NCCL GIN LSA team must cover local_world_size/local_rank")
+        self._dispatch_signal_range, self._combine_signal_range = acquire_nccl_gin(self.ep_group, self.local_world_size,
+                                                                                   min_rail_barriers=self.num_sm,
+                                                                                   require_gin=True)
+        self._has_nccl_gin_lease = True
 
     def finalize(self) -> None:
         ctx = getattr(self, "ep_context", None)
         if self.is_internode:
             if ctx is not None:
                 self.ep_context.release_internode_nccl_resources()
-            torch.cuda.synchronize()
-            torch.distributed.barrier(group=self.ep_group)
-            if self._owns_nccl_gin and _buffer.nccl_gin_is_initialized():
-                _buffer.nccl_gin_destroy()
-            self._owns_nccl_gin = False
-            torch.cuda.synchronize()
-            torch.distributed.barrier(group=self.ep_group)
+            if self._has_nccl_gin_lease:
+                release_nccl_gin(self.ep_group)
+            self._has_nccl_gin_lease = False
         # Coordinated, leak-free release of the symmetric buffers. Critical for the
         # torch_ipc backend so producer storage is not left in torch's CUDA IPC
         # limbo across EPKernels re-creation. Must be called collectively by every
@@ -565,6 +482,254 @@ class EPKernels:
         token_within_expert_offset, _block_cumsum_hist, expert_counts = _ep.compute_stable_local_token_within_expert_offset_and_expert_counts(
             topk_indices, self.ep_context.config.num_experts, num_sm)
         return token_within_expert_offset, expert_counts
+
+    def prepare_chunk_layouts(self, topk_indices: torch.Tensor, token_within_expert_offset: torch.Tensor,
+                              plan: EPChunkPlan) -> tuple[EPCommLayoutDesc, ...]:
+        """Build every step layout with one local device kernel."""
+        if topk_indices.dim() != 2:
+            raise ValueError("topk_indices must be rank-2")
+        num_tokens, topk = topk_indices.shape
+        capacity = self.ep_context.dispatch_output_buf.shape[0]
+        if self.num_worst_tokens <= 0:
+            raise ValueError("range EP requires a fixed receive capacity")
+        if plan.world_size != self.world_size:
+            raise ValueError("chunk plan and EPKernels world size differ")
+        if plan.recv_capacity_tokens != capacity:
+            raise ValueError("chunk plan and EPKernels receive capacity differ")
+        if plan.expert_alignment != self.expert_alignment:
+            raise ValueError("chunk plan and EPKernels expert alignment differ")
+        if plan.topk != topk or topk != self.ep_context.config.topk:
+            raise ValueError("chunk plan and EPKernels topk differ")
+        if plan.num_experts != self.ep_context.config.num_experts:
+            raise ValueError("chunk plan and EPKernels expert count differ")
+        if num_tokens > plan.max_num_tokens:
+            raise ValueError("local token count exceeds the chunk plan specialization")
+        if (plan.logical_token_ranges.device != topk_indices.device
+                or plan.rank_chunk_prefix.device != topk_indices.device):
+            raise ValueError("chunk plan and routing tensors must be on the same CUDA device")
+        if (topk_indices.dtype != torch.int32 or token_within_expert_offset.dtype != torch.int32
+                or not topk_indices.is_cuda or not token_within_expert_offset.is_cuda
+                or not topk_indices.is_contiguous() or not token_within_expert_offset.is_contiguous()
+                or topk_indices.shape != token_within_expert_offset.shape):
+            raise ValueError("routing and token offsets must be matching contiguous CUDA int32 tensors")
+
+        num_steps = plan.max_steps
+        int_opts = {"dtype": torch.int32, "device": topk_indices.device}
+        experts_per_rank = self.ep_context.config.num_experts // self.world_size
+        recv_base_offset = torch.empty((num_steps, self.world_size, experts_per_rank, self.world_size), **int_opts)
+        # Each step owns a step-local sender route plan.  The physical tensor
+        # keeps the full input shape for descriptor compatibility, while only
+        # [0, end - begin) is valid for that step's logical range.
+        # Keep this O(Q*M*K) layout for consistency; revisit O(M*K) storage
+        # only if extreme metadata memory becomes material.
+        token_dst = torch.empty((num_steps, num_tokens, topk), **int_opts)
+        send_mask = torch.empty_like(token_dst)
+        recv_token_count = torch.empty((num_steps, self.world_size), **int_opts)
+        recv_aligned_token_count = torch.empty_like(recv_token_count)
+        recv_expert_counts = torch.empty((num_steps, experts_per_rank), **int_opts)
+        num_tokens_per_rank = None
+        node_topk_indices = None
+        node_topk_send_mask = None
+        node_token_dst_scatter_indices = None
+        if self.is_internode:
+            num_tokens_per_rank = torch.empty_like(recv_token_count)
+            node_shape = (num_steps, self.ep_context.config.nnodes, self.ep_context.config.max_m, topk)
+            node_topk_indices = torch.empty(node_shape, **int_opts)
+            node_topk_send_mask = torch.empty_like(node_topk_indices)
+            node_token_dst_scatter_indices = torch.empty_like(node_topk_indices)
+        _chunk_plan.build_ep_chunk_layouts_out(
+            topk_indices,
+            token_within_expert_offset,
+            plan.logical_token_ranges,
+            plan.rank_chunk_prefix,
+            plan.chunk_size,
+            plan.expert_alignment,
+            recv_base_offset,
+            token_dst,
+            send_mask,
+            recv_token_count,
+            recv_aligned_token_count,
+            recv_expert_counts,
+            num_tokens_per_rank,
+        )
+        if self.check_num_worst_tokens:
+            capacity_count = (recv_aligned_token_count if self.expert_alignment > 1 else recv_token_count)
+            torch._assert_async(
+                torch.all(capacity_count[:, self.rank] <= self.num_worst_tokens),
+                f"num_worst_tokens = {self.num_worst_tokens} is not valid",
+            )
+        return tuple(
+            EPCommLayoutDesc(
+                recv_base_offset=recv_base_offset[step],
+                token_dst_scatter_indices=token_dst[step],
+                token_topk_send_mask=send_mask[step],
+                topk_indices=topk_indices,
+                recv_token_count=recv_token_count[step],
+                recv_aligned_token_count=recv_aligned_token_count[step],
+                recv_expert_counts=recv_expert_counts[step],
+                expert_alignment=self.expert_alignment,
+                num_tokens=num_tokens,
+                num_tokens_per_rank=(num_tokens_per_rank[step] if num_tokens_per_rank is not None else None),
+                node_topk_indices=(node_topk_indices[step] if node_topk_indices is not None else None),
+                node_topk_send_mask=(node_topk_send_mask[step] if node_topk_send_mask is not None else None),
+                node_token_dst_scatter_indices=(
+                    node_token_dst_scatter_indices[step] if node_token_dst_scatter_indices is not None else None),
+                logical_token_range=plan.logical_token_ranges[step],
+            ) for step in range(num_steps))
+
+    def _intranode_range_barrier(self, logical_token_range: torch.Tensor) -> None:
+        _ep.barrier_all_on_stream_range(
+            self.ep_context.nvl_barrier_buf_ptrs,
+            self.rank,
+            self.world_size,
+            logical_token_range,
+        )
+
+    def _range_group_barrier(self, logical_token_range: torch.Tensor) -> None:
+        """Synchronize one active chunk step across the EP group.
+
+        Chunk plans publish the same logical range on every rank.  Keeping the
+        active check inside the backend avoids paying a barrier for the fixed
+        trailing zero steps while preserving the same call sequence for the
+        active steps on both intra- and inter-node EP.
+        """
+        if self.is_internode:
+            _ep_inter.barrier_all_on_stream_if_active(logical_token_range)
+        else:
+            self._intranode_range_barrier(logical_token_range)
+
+    def _validate_range_layout(self, topk_indices: torch.Tensor, layout: EPCommLayoutDesc) -> None:
+        if (layout.logical_token_range is None or tuple(layout.logical_token_range.shape) != (2, )):
+            raise ValueError("prepared range layout must contain logical_token_range[2]")
+        if (layout.token_dst_scatter_indices is None or layout.token_topk_send_mask is None
+                or layout.recv_token_count is None or layout.recv_aligned_token_count is None
+                or layout.recv_expert_counts is None):
+            raise ValueError("prepared range layout is incomplete")
+        if layout.token_dst_scatter_indices.shape != topk_indices.shape:
+            raise ValueError("prepared range layout routing shape mismatch")
+        if layout.recv_token_count.numel() != self.world_size:
+            raise ValueError("prepared range layout world-size mismatch")
+
+    def _dispatch_range(self, input: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor | None,
+                        layout: EPCommLayoutDesc, num_qps: int | None = None):
+        self._validate_range_layout(topk_indices, layout)
+        logical_token_range = layout.logical_token_range
+        experts_per_rank = self.ep_context.config.num_experts // self.world_size
+        if self.is_internode:
+            if (layout.num_tokens_per_rank is None or layout.node_topk_indices is None
+                    or layout.node_topk_send_mask is None or layout.node_token_dst_scatter_indices is None):
+                raise ValueError("prepared internode range layout is incomplete")
+        # Retire consumers of the previous range's symmetric dispatch output
+        # before this rank starts the next range dispatch.  The final dispatch
+        # signal reset protects the GIN protocol, but it does not cover a
+        # recompute path that skipped dispatch postprocess and still has a peer
+        # reading the previous output buffer.
+        self._range_group_barrier(logical_token_range)
+        if self.is_internode:
+            _ep_inter.stage_dispatch_internode_range(
+                input,
+                topk_indices,
+                layout.token_topk_send_mask,
+                layout.token_dst_scatter_indices,
+                topk_weights,
+                self.ep_context.rdma_rail_send_buf,
+                self.ep_context.rdma_rail_send_win_handle,
+                self.ep_context.config.max_m,
+                logical_token_range,
+            )
+            self._range_group_barrier(logical_token_range)
+            _ep_inter.dispatch_internode_range(
+                self.ep_context.dispatch_output_buf_ptrs,
+                self.ep_context.dispatch_topk_weights_buf_ptrs,
+                self.ep_context.dispatch_topk_scatter_indices_buf_ptrs,
+                self.ep_context.dispatch_output_buf.shape[0],
+                self.ep_context.rdma_rail_send_buf,
+                self.ep_context.rdma_rail_send_win_handle,
+                layout.num_tokens_per_rank,
+                layout.node_topk_indices,
+                layout.node_topk_send_mask,
+                layout.node_token_dst_scatter_indices,
+                self.ep_context.config.max_m,
+                input.shape[0],
+                self.ep_context.config.hidden,
+                topk_weights is not None,
+                experts_per_rank,
+                self.num_sm,
+                num_qps,
+                logical_token_range,
+            )
+            _ep_inter.reset_signals_barrier_all_on_stream_if_active(*self._dispatch_signal_range, logical_token_range)
+        else:
+            _ep.dispatch_intranode_range(
+                input,
+                layout.token_topk_send_mask,
+                topk_weights,
+                topk_indices,
+                layout.token_dst_scatter_indices,
+                logical_token_range,
+                self.ep_context.dispatch_output_buf_ptrs,
+                self.ep_context.dispatch_topk_weights_buf_ptrs,
+                self.ep_context.dispatch_topk_scatter_indices_buf_ptrs,
+                self.rank,
+                self.world_size,
+                experts_per_rank,
+                self.num_sm,
+            )
+            self._range_group_barrier(logical_token_range)
+        layout.topk_indices = topk_indices
+        layout.recv_topk_scatter_indices = (self.ep_context.dispatch_topk_scatter_indices_buf)
+        dispatch_weights = (self.ep_context.dispatch_topk_weights_buf if topk_weights is not None else None)
+        return self.ep_context.dispatch_output_buf, dispatch_weights, layout
+
+    def _combine_range(self, input_preprocessed: torch.Tensor, layout: EPCommLayoutDesc, output: torch.Tensor,
+                       weight_preprocessed: torch.Tensor | None = None, output_weight: torch.Tensor | None = None,
+                       num_qps: int | None = None):
+        if layout.topk_indices is None:
+            raise ValueError("range layout requires topk_indices from dispatch")
+        self._validate_range_layout(layout.topk_indices, layout)
+        if not self._validate_combine_input_buffer(input_preprocessed):
+            raise ValueError("range combine input must use the EP combine buffer")
+        if (weight_preprocessed is None) != (output_weight is None):
+            raise ValueError("weight_preprocessed and output_weight must be both set or both None")
+        logical_range = layout.logical_token_range
+        if self.is_internode:
+            self._range_group_barrier(logical_range)
+            _ep_inter.combine_internode_range(
+                self.ep_context.combine_input_buf_ptrs,
+                self.ep_context.combine_topk_weights_buf_ptrs if weight_preprocessed is not None else None,
+                self.ep_context.rdma_rail_send_buf,
+                self.ep_context.rdma_rail_send_win_handle,
+                layout.num_tokens_per_rank,
+                output,
+                layout.node_topk_indices,
+                layout.node_topk_send_mask,
+                layout.node_token_dst_scatter_indices,
+                output_weight,
+                self.ep_context.config.max_m,
+                self.ep_context.config.num_experts // self.world_size,
+                self.num_sm,
+                num_qps,
+                logical_range,
+            )
+            _ep_inter.reset_signals_barrier_all_on_stream_if_active(*self._combine_signal_range, logical_range)
+            return output, output_weight
+        self._range_group_barrier(logical_range)
+        _ep.combine_intranode_range(
+            self.ep_context.combine_input_buf_ptrs,
+            layout.token_topk_send_mask,
+            layout.topk_indices,
+            layout.token_dst_scatter_indices,
+            logical_range,
+            output,
+            self.rank,
+            self.world_size,
+            self.ep_context.config.num_experts // self.world_size,
+            self.num_sm,
+            self.ep_context.combine_topk_weights_buf_ptrs if weight_preprocessed is not None else None,
+            output_weight,
+        )
+        self._range_group_barrier(logical_range)
+        return output, output_weight
 
     def get_combine_buffer(self, num_recv_tokens: int, dtype: torch.dtype = None) -> torch.Tensor:
         max_capacity = self.ep_context.combine_input_buf.shape[0]
@@ -853,6 +1018,9 @@ class EPKernels:
                                           local_world_size=self.ep_context.config.local_world_size,
                                           max_slot_num_token=self.ep_context.config.max_m)
 
+        if layout_desc.logical_token_range is not None:
+            return self._dispatch_range(input, topk_indices, topk_weights, layout_desc, num_qps=num_qps)
+
         if self.ep_context.config.nnodes == 1:
             # num_qps only affects internode RDMA traffic; ignored intranode so
             # the same caller code runs on a single node.
@@ -869,7 +1037,15 @@ class EPKernels:
         return self.combine_intranode_preprocess(input, layout_desc, weight=weight, zero_copy=zero_copy, num_sm=num_sm)
 
     def combine(self, input_preprocessed: torch.Tensor, layout_desc: EPCommLayoutDesc,
-                weight_preprocessed: torch.Tensor | None = None, num_qps: int | None = None):
+                weight_preprocessed: torch.Tensor | None = None, num_qps: int | None = None, *,
+                output: torch.Tensor | None = None, output_weight: torch.Tensor | None = None):
+        if layout_desc.logical_token_range is not None:
+            if output is None:
+                raise ValueError("range combine requires the caller-owned full output tensor")
+            return self._combine_range(input_preprocessed, layout_desc, output, weight_preprocessed=weight_preprocessed,
+                                       output_weight=output_weight, num_qps=num_qps)
+        if output is not None or output_weight is not None:
+            raise ValueError("output/output_weight are only valid for range combine")
         if self.ep_context.config.nnodes == 1:
             # num_qps ignored intranode (see dispatch).
             return self.combine_intranode(input_preprocessed, layout_desc=layout_desc,

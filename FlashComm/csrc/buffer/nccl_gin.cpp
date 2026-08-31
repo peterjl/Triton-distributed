@@ -112,25 +112,39 @@ void init_comm(NcclGinState &st, const ncclUniqueId &nccl_id, int rank,
   NCCL_CHECK(ncclCommInitRank(&st.comm, nranks, nccl_id, rank));
   ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
   NCCL_CHECK(ncclCommQueryProperties(st.comm, &props));
-  st.gin_type = static_cast<int>(props.ginType);
-  if (!props.deviceApiSupport || props.ginType == NCCL_GIN_TYPE_NONE) {
+  if (!props.deviceApiSupport) {
     throw std::runtime_error(
-        "NCCL GIN unavailable: set NCCL_GIN_ENABLE=1 NCCL_GIN_TYPE=3");
+        "NCCL device API is unavailable on this communicator");
   }
 
   ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  st.gin_type = static_cast<int>(props.ginType);
+  const bool has_gin = props.ginType != NCCL_GIN_TYPE_NONE;
   reqs.ginForceEnable = false;
+  // EP kernels use ncclBarrierSession(..., ncclTeamTagWorld(), ...), whose
+  // device handles are the hybrid LSA/rail (or full-world) barriers.  NCCL
+  // allocates those handles from barrierCount; lsaBarrierCount and
+  // railGinBarrierCount allocate the independent tag-specific barriers and
+  // leave the hybrid handles uninitialized.
+  reqs.barrierCount = has_gin ? rail_barriers : 0;
+  // Planner kernels use the explicit LSA barrier whenever the communicator is
+  // physically covered by one LSA team, even if GIN also happens to be
+  // available.  EP internode kernels use the hybrid barrier above.
   reqs.lsaBarrierCount = rail_barriers;
-  reqs.railGinBarrierCount = rail_barriers;
-  reqs.ginSignalCount = gin_signals;
-  reqs.ginContextCount = gin_contexts;
-  reqs.ginQueueDepth = gin_queue_depth;
+  reqs.ginSignalCount = has_gin ? gin_signals : 0;
+  reqs.ginContextCount = has_gin ? gin_contexts : 0;
+  reqs.ginQueueDepth = has_gin ? gin_queue_depth : 0;
   reqs.ginConnectionType =
-      static_cast<ncclGinConnectionType_t>(gin_connection_type);
+      has_gin ? static_cast<ncclGinConnectionType_t>(gin_connection_type)
+              : NCCL_GIN_CONNECTION_NONE;
   NCCL_CHECK(ncclDevCommCreate(st.comm, &reqs, &st.dev_comm));
   st.initialized = true;
   st.lsa_rank = st.dev_comm.lsaRank;
   st.lsa_size = st.dev_comm.lsaSize;
+  if (!has_gin && st.lsa_size < nranks) {
+    throw std::runtime_error("NCCL GIN unavailable and the LSA team does not "
+                             "cover the communicator");
+  }
   if (st.lsa_size < local_world_size ||
       (st.lsa_rank % local_world_size) != (rank % local_world_size)) {
     throw std::runtime_error(
@@ -178,6 +192,7 @@ int nccl_gin_init_rank(const void *uid, int uid_len, int rank, int nranks,
   try {
     init_comm(st, nccl_id, rank, nranks, local_world_size, gin_contexts,
               gin_signals, rail_barriers, gin_queue_depth, gin_connection_type);
+    st.ref_count = 1;
     return st.gin_type;
   } catch (...) {
     try {
@@ -190,7 +205,33 @@ int nccl_gin_init_rank(const void *uid, int uid_len, int rank, int nranks,
 
 void nccl_gin_destroy_rank() {
   std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_state.initialized && g_state.comm == nullptr) {
+    return;
+  }
+  if (g_state.ref_count > 1) {
+    --g_state.ref_count;
+    return;
+  }
   destroy_unlocked();
+}
+
+void nccl_gin_retain_rank() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_state.initialized || g_state.ref_count <= 0) {
+    throw std::runtime_error("NCCL GIN is not initialized");
+  }
+  ++g_state.ref_count;
+}
+
+void nccl_gin_release_rank() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_state.initialized || g_state.ref_count <= 0) {
+    throw std::runtime_error("NCCL GIN has no active resource lease");
+  }
+  --g_state.ref_count;
+  if (g_state.ref_count == 0) {
+    destroy_unlocked();
+  }
 }
 
 int nccl_gin_is_initialized() {
@@ -222,6 +263,8 @@ int nccl_gin_local_world_size() {
 int nccl_gin_lsa_rank() { return nccl_gin_require_state().lsa_rank; }
 
 int nccl_gin_lsa_size() { return nccl_gin_require_state().lsa_size; }
+
+int nccl_gin_type() { return nccl_gin_require_state().gin_type; }
 
 } // namespace buffer
 } // namespace flash_comm

@@ -153,7 +153,16 @@ void dispatch_internode_cuda(
     int32_t local_world_size, int32_t max_recv_tokens, int32_t num_sm,
     const void *dev_comm_host, int32_t num_qps, FlashCommDType dtype,
     FlashCommDType weight_dtype, FlashCommDType offset_dtype, int32_t topk,
-    int32_t dispatch_pipeline_chunks, cudaStream_t stream);
+    int32_t dispatch_pipeline_chunks, const int32_t *logical_token_range,
+    cudaStream_t stream);
+
+void stage_dispatch_internode_range_cuda(
+    uintptr_t rdma_rail_send_win_handle, const void *x,
+    const int32_t *topk_indices, const int32_t *topk_send_mask,
+    const int32_t *token_dst_scatter_indices, const void *topk_weights,
+    int32_t num_token, int32_t max_slot_num_token, int32_t hidden_size,
+    int32_t topk, int32_t rank, int32_t local_world_size,
+    const int32_t *logical_token_range, cudaStream_t stream);
 
 void combine_internode_cuda(
     void *combine_x_ptrs, void *combine_weight_ptrs,
@@ -165,12 +174,17 @@ void combine_internode_cuda(
     int32_t rank, int32_t num_ranks, int32_t local_world_size, int32_t num_sm,
     const void *dev_comm_host, int32_t num_qps, FlashCommDType dtype,
     FlashCommDType weight_dtype, FlashCommDType offset_dtype,
-    int32_t combine_pipeline_chunks, cudaStream_t stream);
+    int32_t combine_pipeline_chunks, const int32_t *logical_token_range,
+    cudaStream_t stream);
 
 // Flushes all payload contexts and performs the world barrier. Does not touch
 // any GIN signal.
 void internode_barrier_on_stream_cuda(const void *dev_comm_host,
                                       int32_t max_qps, cudaStream_t stream);
+
+void internode_barrier_on_stream_if_active_cuda(
+    const void *dev_comm_host, int32_t max_qps,
+    const int32_t *logical_token_range, cudaStream_t stream);
 
 // Fused variant: resets the context-local EP GIN signals in
 // [signal_begin, signal_end) to 0 on every context in [0, max_qps) and then
@@ -181,6 +195,11 @@ void internode_reset_signals_barrier_on_stream_cuda(const void *dev_comm_host,
                                                     int32_t signal_begin,
                                                     int32_t signal_end,
                                                     cudaStream_t stream);
+
+void internode_reset_signals_barrier_on_stream_if_active_cuda(
+    const void *dev_comm_host, int32_t max_qps, int32_t signal_begin,
+    int32_t signal_end, const int32_t *logical_token_range,
+    cudaStream_t stream);
 
 void compute_dispatch_layout_cuda(
     int32_t *topk_indices, int32_t *token_within_expert_offset,

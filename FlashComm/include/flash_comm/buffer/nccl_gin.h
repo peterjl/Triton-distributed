@@ -53,6 +53,11 @@ struct NcclGinState {
   // GIN signals and protects RDMA slot reuse.
   bool ep_dispatch_needs_barrier = false;
   bool ep_combine_needs_barrier = false;
+  // Process-local resource leases.  The communicator is process-global, but
+  // independent owners (for example EP and EPChunkPlanner) may keep NCCL
+  // windows alive at the same time.  This counter protects the communicator
+  // from being destroyed while another owner still has registered windows.
+  int ref_count = 0;
   bool initialized = false;
 };
 
@@ -65,6 +70,8 @@ int nccl_gin_init_rank(const void *uid, int uid_len, int rank, int nranks,
                        int gin_connection_type, int ep_num_qps = 1);
 
 void nccl_gin_destroy_rank();
+void nccl_gin_retain_rank();
+void nccl_gin_release_rank();
 int nccl_gin_is_initialized();
 
 NcclGinState &nccl_gin_require_state();
@@ -75,6 +82,7 @@ int nccl_gin_nranks();
 int nccl_gin_local_world_size();
 int nccl_gin_lsa_rank();
 int nccl_gin_lsa_size();
+int nccl_gin_type();
 
 } // namespace buffer
 } // namespace flash_comm

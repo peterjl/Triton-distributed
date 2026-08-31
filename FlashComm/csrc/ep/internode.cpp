@@ -94,7 +94,7 @@ optional_chunk_env(const char *name, int32_t default_value, int32_t max_value) {
 
 } // namespace
 
-void dispatch_internode(
+static void dispatch_internode_impl(
     torch::Tensor recv_x_ptrs, torch::Tensor recv_weights_ptrs,
     torch::Tensor recv_topk_scatter_indices_ptrs, int32_t max_recv_tokens,
     torch::Tensor rdma_rail_send_buf, uintptr_t rdma_rail_send_win_handle,
@@ -103,7 +103,8 @@ void dispatch_internode(
     torch::Tensor node_token_dst_scatter_indices, int32_t max_slot_num_token,
     int32_t local_num_token, int32_t hidden_size, bool has_weight,
     int32_t num_experts_per_rank, int32_t num_sm,
-    c10::optional<int64_t> opt_num_qps) {
+    c10::optional<int64_t> opt_num_qps,
+    c10::optional<torch::Tensor> optional_logical_token_range) {
   if (!buffer::nccl_gin_is_initialized()) {
     throw std::runtime_error(
         "NCCL GIN not initialized; call buffer.nccl_gin_init first");
@@ -178,6 +179,15 @@ void dispatch_internode(
       << kMaxDispatchPipelineChunks << "]";
   checked_window_user_ptr(ep_state.comm, rdma_rail_send_win_handle,
                           rdma_rail_send_buf, "rdma_rail_send_buf");
+  const int32_t *logical_token_range_ptr = nullptr;
+  if (optional_logical_token_range.has_value() &&
+      optional_logical_token_range.value().defined()) {
+    auto logical_token_range = optional_logical_token_range.value();
+    check_tensor_common(logical_token_range, "logical_token_range", true,
+                        torch::kInt32, 1);
+    check_tensor_shape(logical_token_range, "logical_token_range", {2});
+    logical_token_range_ptr = logical_token_range.data_ptr<int32_t>();
+  }
   dispatch_internode_cuda(
       rdma_rail_send_win_handle, num_tokens_per_rank.data_ptr<int32_t>(),
       node_topk_indices.data_ptr<int32_t>(),
@@ -188,8 +198,47 @@ void dispatch_internode(
       reinterpret_cast<void **>(recv_topk_scatter_indices_ptrs.data_ptr()),
       max_slot_num_token, hidden_size, num_experts_per_rank, rank, num_ranks,
       local_world_size, max_recv_tokens, num_sm, dev_comm, num_qps, dtype,
-      weight_dtype, offset_dtype, topk, dispatch_pipeline_chunks, stream);
+      weight_dtype, offset_dtype, topk, dispatch_pipeline_chunks,
+      logical_token_range_ptr, stream);
   ep_state.ep_dispatch_needs_barrier = true;
+}
+
+void dispatch_internode(
+    torch::Tensor recv_x_ptrs, torch::Tensor recv_weights_ptrs,
+    torch::Tensor recv_topk_scatter_indices_ptrs, int32_t max_recv_tokens,
+    torch::Tensor rdma_rail_send_buf, uintptr_t rdma_rail_send_win_handle,
+    torch::Tensor num_tokens_per_rank, torch::Tensor node_topk_indices,
+    torch::Tensor node_topk_send_mask,
+    torch::Tensor node_token_dst_scatter_indices, int32_t max_slot_num_token,
+    int32_t local_num_token, int32_t hidden_size, bool has_weight,
+    int32_t num_experts_per_rank, int32_t num_sm,
+    c10::optional<int64_t> opt_num_qps) {
+  dispatch_internode_impl(
+      recv_x_ptrs, recv_weights_ptrs, recv_topk_scatter_indices_ptrs,
+      max_recv_tokens, rdma_rail_send_buf, rdma_rail_send_win_handle,
+      num_tokens_per_rank, node_topk_indices, node_topk_send_mask,
+      node_token_dst_scatter_indices, max_slot_num_token, local_num_token,
+      hidden_size, has_weight, num_experts_per_rank, num_sm, opt_num_qps,
+      c10::nullopt);
+}
+
+void dispatch_internode_range(
+    torch::Tensor recv_x_ptrs, torch::Tensor recv_weights_ptrs,
+    torch::Tensor recv_topk_scatter_indices_ptrs, int32_t max_recv_tokens,
+    torch::Tensor rdma_rail_send_buf, uintptr_t rdma_rail_send_win_handle,
+    torch::Tensor num_tokens_per_rank, torch::Tensor node_topk_indices,
+    torch::Tensor node_topk_send_mask,
+    torch::Tensor node_token_dst_scatter_indices, int32_t max_slot_num_token,
+    int32_t local_num_token, int32_t hidden_size, bool has_weight,
+    int32_t num_experts_per_rank, int32_t num_sm,
+    c10::optional<int64_t> opt_num_qps, torch::Tensor logical_token_range) {
+  dispatch_internode_impl(
+      recv_x_ptrs, recv_weights_ptrs, recv_topk_scatter_indices_ptrs,
+      max_recv_tokens, rdma_rail_send_buf, rdma_rail_send_win_handle,
+      num_tokens_per_rank, node_topk_indices, node_topk_send_mask,
+      node_token_dst_scatter_indices, max_slot_num_token, local_num_token,
+      hidden_size, has_weight, num_experts_per_rank, num_sm, opt_num_qps,
+      logical_token_range);
 }
 
 void barrier_all_on_stream() {
@@ -201,6 +250,22 @@ void barrier_all_on_stream() {
   auto &ep_state = buffer::nccl_gin_require_state();
   const void *dev_comm = static_cast<const void *>(&ep_state.dev_comm);
   internode_barrier_on_stream_cuda(dev_comm, ep_state.ep_num_qps, stream);
+}
+
+void barrier_all_on_stream_if_active(torch::Tensor logical_token_range) {
+  if (!buffer::nccl_gin_is_initialized()) {
+    throw std::runtime_error(
+        "NCCL GIN not initialized; call buffer.nccl_gin_init first");
+  }
+  check_tensor_common(logical_token_range, "logical_token_range", true,
+                      torch::kInt32, 1);
+  check_tensor_shape(logical_token_range, "logical_token_range", {2});
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto &ep_state = buffer::nccl_gin_require_state();
+  const void *dev_comm = static_cast<const void *>(&ep_state.dev_comm);
+  internode_barrier_on_stream_if_active_cuda(
+      dev_comm, ep_state.ep_num_qps, logical_token_range.data_ptr<int32_t>(),
+      stream);
 }
 
 // Fused reset-signals-then-barrier over an explicit EP signal id range. Must
@@ -236,7 +301,38 @@ void reset_signals_barrier_all_on_stream(int64_t signal_begin,
   }
 }
 
-void combine_internode(
+void reset_signals_barrier_all_on_stream_if_active(
+    int64_t signal_begin, int64_t signal_end,
+    torch::Tensor logical_token_range) {
+  if (!buffer::nccl_gin_is_initialized()) {
+    throw std::runtime_error(
+        "NCCL GIN not initialized; call buffer.nccl_gin_init first");
+  }
+  check_tensor_common(logical_token_range, "logical_token_range", true,
+                      torch::kInt32, 1);
+  check_tensor_shape(logical_token_range, "logical_token_range", {2});
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto &ep_state = buffer::nccl_gin_require_state();
+  const int32_t nnodes = ep_state.nnodes;
+  const int32_t total = ep_required_gin_signal_count(nnodes);
+  FLASH_CHECK(signal_begin >= 0 && signal_begin <= signal_end &&
+              signal_end <= total);
+  const void *dev_comm = static_cast<const void *>(&ep_state.dev_comm);
+  internode_reset_signals_barrier_on_stream_if_active_cuda(
+      dev_comm, ep_state.ep_num_qps, static_cast<int32_t>(signal_begin),
+      static_cast<int32_t>(signal_end), logical_token_range.data_ptr<int32_t>(),
+      stream);
+  // Host enqueue state follows the fixed call sequence, while the device
+  // decides whether this plan row owns any protocol state to reset.
+  if (signal_begin == 0 && signal_end >= ep_dispatch_signal_count(nnodes)) {
+    ep_state.ep_dispatch_needs_barrier = false;
+  }
+  if (signal_begin <= ep_combine_signal_base(nnodes) && signal_end == total) {
+    ep_state.ep_combine_needs_barrier = false;
+  }
+}
+
+static void combine_internode_impl(
     torch::Tensor combine_x_ptrs,
     c10::optional<torch::Tensor> optional_combine_weight_ptrs,
     torch::Tensor rdma_rail_send_buf, uintptr_t rdma_rail_send_win_handle,
@@ -245,7 +341,8 @@ void combine_internode(
     torch::Tensor local_token_dst_scatter_indices,
     c10::optional<torch::Tensor> optional_output_weight,
     int32_t max_slot_num_token, int32_t num_experts_per_rank, int32_t num_sm,
-    c10::optional<int64_t> opt_num_qps) {
+    c10::optional<int64_t> opt_num_qps,
+    c10::optional<torch::Tensor> optional_logical_token_range) {
   if (!buffer::nccl_gin_is_initialized()) {
     throw std::runtime_error(
         "NCCL GIN not initialized; call buffer.nccl_gin_init first");
@@ -281,30 +378,42 @@ void combine_internode(
   FLASH_CHECK(local_token_dst_scatter_indices.is_cuda() &&
               local_token_dst_scatter_indices.is_contiguous() &&
               local_token_dst_scatter_indices.scalar_type() == torch::kInt32);
+  const int32_t num_token = output.size(0);
+  const int32_t hidden_size = output.size(1);
   void *combine_weight_ptrs = nullptr;
   void *output_weight = nullptr;
-  bool has_weight = false;
+  bool has_combine_weight = false;
+  bool has_output_weight = false;
+  bool empty_output_weight = false;
   auto weight_dtype = FlashCommDType::Float32;
   if (optional_combine_weight_ptrs.has_value() &&
       optional_combine_weight_ptrs.value().defined()) {
     check_ptrs_tensor_i64(optional_combine_weight_ptrs.value(),
                           local_world_size, "combine_weight_ptrs");
     combine_weight_ptrs = optional_combine_weight_ptrs.value().data_ptr();
-    has_weight = true;
+    has_combine_weight = true;
   }
   if (optional_output_weight.has_value() &&
       optional_output_weight.value().defined()) {
     auto out_weight = optional_output_weight.value();
     FLASH_CHECK(out_weight.is_cuda() && out_weight.is_contiguous());
-    output_weight = out_weight.data_ptr();
+    empty_output_weight = out_weight.numel() == 0;
+    FLASH_CHECK(!empty_output_weight || num_token == 0)
+        << "empty output_weight requires an empty output";
+    output_weight = empty_output_weight ? nullptr : out_weight.data_ptr();
     weight_dtype = get_flash_comm_dtype(out_weight.scalar_type());
-    has_weight = true;
+    has_output_weight = !empty_output_weight;
   }
-  FLASH_CHECK((combine_weight_ptrs != nullptr) == (output_weight != nullptr))
+  if (empty_output_weight) {
+    // There is no output row that can consume the weight path.  Disable both
+    // sides together so kHasWeight=true is never launched with a null output.
+    combine_weight_ptrs = nullptr;
+    has_combine_weight = false;
+  }
+  FLASH_CHECK(has_combine_weight == has_output_weight)
       << "combine_weight_ptrs and output_weight must be both set or both null";
+  const bool has_weight = has_combine_weight;
 
-  const int32_t num_token = output.size(0);
-  const int32_t hidden_size = output.size(1);
   FLASH_CHECK(local_topk_indices.dim() == 3);
   const int32_t topk = local_topk_indices.size(2);
   FLASH_CHECK(topk > 0);
@@ -337,6 +446,15 @@ void combine_internode(
       << "]";
   checked_window_user_ptr(ep_state.comm, rdma_rail_send_win_handle,
                           rdma_rail_send_buf, "rdma_rail_send_buf");
+  const int32_t *logical_token_range_ptr = nullptr;
+  if (optional_logical_token_range.has_value() &&
+      optional_logical_token_range.value().defined()) {
+    auto logical_token_range = optional_logical_token_range.value();
+    check_tensor_common(logical_token_range, "logical_token_range", true,
+                        torch::kInt32, 1);
+    check_tensor_shape(logical_token_range, "logical_token_range", {2});
+    logical_token_range_ptr = logical_token_range.data_ptr<int32_t>();
+  }
   combine_internode_cuda(
       combine_x_ptrs.data_ptr(), combine_weight_ptrs, rdma_rail_send_win_handle,
       output.data_ptr(), output_weight, local_topk_indices.data_ptr<int32_t>(),
@@ -345,8 +463,45 @@ void combine_internode(
       num_tokens_per_rank.data_ptr<int32_t>(), has_weight, num_token,
       max_slot_num_token, hidden_size, topk, num_experts_per_rank, rank,
       num_ranks, local_world_size, num_sm, dev_comm, num_qps, dtype,
-      weight_dtype, offset_dtype, combine_pipeline_chunks, stream);
+      weight_dtype, offset_dtype, combine_pipeline_chunks,
+      logical_token_range_ptr, stream);
   ep_state.ep_combine_needs_barrier = true;
+}
+
+void combine_internode(
+    torch::Tensor combine_x_ptrs,
+    c10::optional<torch::Tensor> optional_combine_weight_ptrs,
+    torch::Tensor rdma_rail_send_buf, uintptr_t rdma_rail_send_win_handle,
+    torch::Tensor num_tokens_per_rank, torch::Tensor output,
+    torch::Tensor local_topk_indices, torch::Tensor local_topk_send_mask,
+    torch::Tensor local_token_dst_scatter_indices,
+    c10::optional<torch::Tensor> optional_output_weight,
+    int32_t max_slot_num_token, int32_t num_experts_per_rank, int32_t num_sm,
+    c10::optional<int64_t> opt_num_qps) {
+  combine_internode_impl(
+      combine_x_ptrs, optional_combine_weight_ptrs, rdma_rail_send_buf,
+      rdma_rail_send_win_handle, num_tokens_per_rank, output,
+      local_topk_indices, local_topk_send_mask, local_token_dst_scatter_indices,
+      optional_output_weight, max_slot_num_token, num_experts_per_rank, num_sm,
+      opt_num_qps, c10::nullopt);
+}
+
+void combine_internode_range(
+    torch::Tensor combine_x_ptrs,
+    c10::optional<torch::Tensor> optional_combine_weight_ptrs,
+    torch::Tensor rdma_rail_send_buf, uintptr_t rdma_rail_send_win_handle,
+    torch::Tensor num_tokens_per_rank, torch::Tensor output,
+    torch::Tensor local_topk_indices, torch::Tensor local_topk_send_mask,
+    torch::Tensor local_token_dst_scatter_indices,
+    c10::optional<torch::Tensor> optional_output_weight,
+    int32_t max_slot_num_token, int32_t num_experts_per_rank, int32_t num_sm,
+    c10::optional<int64_t> opt_num_qps, torch::Tensor logical_token_range) {
+  combine_internode_impl(
+      combine_x_ptrs, optional_combine_weight_ptrs, rdma_rail_send_buf,
+      rdma_rail_send_win_handle, num_tokens_per_rank, output,
+      local_topk_indices, local_topk_send_mask, local_token_dst_scatter_indices,
+      optional_output_weight, max_slot_num_token, num_experts_per_rank, num_sm,
+      opt_num_qps, logical_token_range);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -463,6 +618,55 @@ compute_dispatch_layout(
           recv_aligned_token_count, recv_expert_counts};
 }
 
+void stage_dispatch_internode_range(
+    torch::Tensor x, torch::Tensor topk_indices, torch::Tensor topk_send_mask,
+    torch::Tensor token_dst_scatter_indices,
+    c10::optional<torch::Tensor> optional_topk_weights,
+    torch::Tensor rdma_rail_send_buf, uintptr_t rdma_rail_send_win_handle,
+    int32_t max_slot_num_token, torch::Tensor logical_token_range) {
+  if (!buffer::nccl_gin_is_initialized()) {
+    throw std::runtime_error(
+        "NCCL GIN not initialized; call buffer.nccl_gin_init first");
+  }
+  auto &ep_state = buffer::nccl_gin_require_state();
+  FLASH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2 &&
+              x.scalar_type() == torch::kBFloat16);
+  check_topk_indices(topk_indices);
+  FLASH_CHECK(topk_indices.sizes() == topk_send_mask.sizes() &&
+              topk_indices.sizes() == token_dst_scatter_indices.sizes() &&
+              topk_indices.size(0) == x.size(0));
+  FLASH_CHECK(topk_send_mask.is_cuda() && topk_send_mask.is_contiguous() &&
+              topk_send_mask.scalar_type() == torch::kInt32);
+  FLASH_CHECK(token_dst_scatter_indices.is_cuda() &&
+              token_dst_scatter_indices.is_contiguous() &&
+              token_dst_scatter_indices.scalar_type() == torch::kInt32);
+  const void *weights_ptr = nullptr;
+  if (optional_topk_weights.has_value() &&
+      optional_topk_weights.value().defined()) {
+    auto weights = optional_topk_weights.value();
+    FLASH_CHECK(weights.is_cuda() && weights.is_contiguous() &&
+                weights.scalar_type() == torch::kFloat32 &&
+                weights.sizes() == topk_indices.sizes());
+    weights_ptr = weights.data_ptr();
+  }
+  FLASH_CHECK(max_slot_num_token >= x.size(0));
+  check_tensor_common(logical_token_range, "logical_token_range", true,
+                      torch::kInt32, 1);
+  check_tensor_shape(logical_token_range, "logical_token_range", {2});
+  checked_window_user_ptr(ep_state.comm, rdma_rail_send_win_handle,
+                          rdma_rail_send_buf, "rdma_rail_send_buf");
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  stage_dispatch_internode_range_cuda(
+      rdma_rail_send_win_handle, x.data_ptr(), topk_indices.data_ptr<int32_t>(),
+      topk_send_mask.data_ptr<int32_t>(),
+      token_dst_scatter_indices.data_ptr<int32_t>(), weights_ptr,
+      static_cast<int32_t>(x.size(0)), max_slot_num_token,
+      static_cast<int32_t>(x.size(1)),
+      static_cast<int32_t>(topk_indices.size(1)), ep_state.rank,
+      ep_state.local_world_size, logical_token_range.data_ptr<int32_t>(),
+      stream);
+}
+
 void bind_internode_ops(py::module &m) {
   // Single source of truth for the GIN signal-space layout
   // (flash_comm/ep/internode.h). Python must not redefine these values.
@@ -486,12 +690,17 @@ void bind_internode_ops(py::module &m) {
       "ep_required_gin_signal_count).");
 
   m.def("barrier_all_on_stream", &barrier_all_on_stream);
+  m.def("barrier_all_on_stream_if_active", &barrier_all_on_stream_if_active,
+        py::arg("logical_token_range"));
   m.def("reset_signals_barrier_all_on_stream",
         &reset_signals_barrier_all_on_stream, py::arg("signal_begin"),
         py::arg("signal_end"),
         "Reset EP GIN signals in [signal_begin, signal_end) at the quiescent "
         "point, then world barrier. Required after each internode "
         "dispatch/combine with that protocol's signal range.");
+  m.def("reset_signals_barrier_all_on_stream_if_active",
+        &reset_signals_barrier_all_on_stream_if_active, py::arg("signal_begin"),
+        py::arg("signal_end"), py::arg("logical_token_range"));
 
   m.def("compute_dispatch_layout", &compute_dispatch_layout,
         py::arg("topk_indices"), py::arg("token_within_expert_offset"),
@@ -500,6 +709,11 @@ void bind_internode_ops(py::module &m) {
         py::arg("num_sm"), py::arg("recv_token_count_cpu") = c10::nullopt,
         py::arg("recv_token_count") = c10::nullopt,
         py::arg("expert_alignment") = 1);
+  m.def("stage_dispatch_internode_range", &stage_dispatch_internode_range,
+        py::arg("x"), py::arg("topk_indices"), py::arg("topk_send_mask"),
+        py::arg("token_dst_scatter_indices"), py::arg("topk_weights"),
+        py::arg("rdma_rail_send_buf"), py::arg("rdma_rail_send_win_handle"),
+        py::arg("max_slot_num_token"), py::arg("logical_token_range"));
 
   m.def(
       "rdma_rail_send_slot_stride_bytes",
@@ -553,6 +767,17 @@ void bind_internode_ops(py::module &m) {
         py::arg("hidden_size"), py::arg("has_weight"),
         py::arg("num_experts_per_rank"), py::arg("num_sm"),
         py::arg("num_qps") = c10::nullopt);
+  m.def("dispatch_internode_range", &dispatch_internode_range,
+        py::arg("recv_x_ptrs"), py::arg("recv_weights_ptrs"),
+        py::arg("recv_topk_scatter_indices_ptrs"), py::arg("max_recv_tokens"),
+        py::arg("rdma_rail_send_buf"), py::arg("rdma_rail_send_win_handle"),
+        py::arg("num_tokens_per_rank"), py::arg("node_topk_indices"),
+        py::arg("node_topk_send_mask"),
+        py::arg("node_token_dst_scatter_indices"),
+        py::arg("max_slot_num_token"), py::arg("local_num_token"),
+        py::arg("hidden_size"), py::arg("has_weight"),
+        py::arg("num_experts_per_rank"), py::arg("num_sm"), py::arg("num_qps"),
+        py::arg("logical_token_range"));
 
   m.def("combine_internode", &combine_internode, py::arg("combine_x_ptrs"),
         py::arg("combine_weight_ptrs"), py::arg("rdma_rail_send_buf"),
@@ -562,6 +787,14 @@ void bind_internode_ops(py::module &m) {
         py::arg("local_token_dst_scatter_indices"), py::arg("output_weight"),
         py::arg("max_slot_num_token"), py::arg("num_experts_per_rank"),
         py::arg("num_sm"), py::arg("num_qps") = c10::nullopt);
+  m.def("combine_internode_range", &combine_internode_range,
+        py::arg("combine_x_ptrs"), py::arg("combine_weight_ptrs"),
+        py::arg("rdma_rail_send_buf"), py::arg("rdma_rail_send_win_handle"),
+        py::arg("num_tokens_per_rank"), py::arg("output"),
+        py::arg("local_topk_indices"), py::arg("local_topk_send_mask"),
+        py::arg("local_token_dst_scatter_indices"), py::arg("output_weight"),
+        py::arg("max_slot_num_token"), py::arg("num_experts_per_rank"),
+        py::arg("num_sm"), py::arg("num_qps"), py::arg("logical_token_range"));
 }
 
 } // namespace internode

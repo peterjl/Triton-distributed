@@ -214,8 +214,10 @@ def get_extension():
     sources = [
         os.path.join("csrc", "ep", "kernels", "intranode_cuda.cu"),
         os.path.join("csrc", "ep", "kernels", "internode_cuda.cu"),
+        os.path.join("csrc", "ep", "kernels", "chunk_plan_cuda.cu"),
         os.path.join("csrc", "ep", "intranode.cpp"),
         os.path.join("csrc", "ep", "internode.cpp"),
+        os.path.join("csrc", "ep", "chunk_plan.cpp"),
         os.path.join("csrc", "bindings.cpp"),
         os.path.join("csrc", "buffer", "pybind.cpp"),
         os.path.join("csrc", "buffer", "nccl_gin.cpp"),
