@@ -29,9 +29,11 @@
 #define FLASH_COMM_SUPPORTED_HIDDEN_SIZES(OP, ...)                             \
   OP(1024, __VA_ARGS__)                                                        \
   OP(1536, __VA_ARGS__)                                                        \
+  OP(1792, __VA_ARGS__)                                                        \
   OP(2048, __VA_ARGS__)                                                        \
   OP(2304, __VA_ARGS__)                                                        \
   OP(2432, __VA_ARGS__)                                                        \
+  OP(2560, __VA_ARGS__)                                                        \
   OP(2816, __VA_ARGS__)                                                        \
   OP(3072, __VA_ARGS__)                                                        \
   OP(3328, __VA_ARGS__)                                                        \
