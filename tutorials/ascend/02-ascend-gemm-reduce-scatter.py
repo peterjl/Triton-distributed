@@ -6,7 +6,7 @@
 
 import os
 import torch
-import torch_npu
+import torch_npu  # noqa: F401
 import shmem as ash
 import torch.distributed as dist
 import triton
@@ -18,7 +18,7 @@ from triton_dist.language.extra.ascend.algorithm import (
     gemm_swizzle2d_Nz,
 )
 from triton.language.extra.cann.extension import sub_vec_id
-import numpy as np
+import numpy as np  # noqa: F401
 
 g_ash_size = 1024 * 1024 * 1024
 g_malloc_size = 8 * 1024 * 1024
